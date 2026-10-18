@@ -9,6 +9,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        // One thread, no debug info in release: smaller binary, nothing to map at startup.
+        .single_threaded = true,
+        .strip = optimize != .Debug,
+        .unwind_tables = if (optimize == .Debug) null else .none,
     });
     // ReleaseSafe turns on glibc's fortify wrappers, which translate-c cannot import.
     mod.addCMacro("_FORTIFY_SOURCE", "0");

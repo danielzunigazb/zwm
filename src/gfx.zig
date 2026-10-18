@@ -95,6 +95,63 @@ const ttf = struct {
     }
 };
 
+/// Rasterised glyph coverage, kept so redrawing text (the bar repaints every frame while the
+/// workspace pill glides) never goes back to FreeType. Open-addressed, fixed size; once it is
+/// nearly full new glyphs are simply rendered uncached.
+const glyphs = struct {
+    const Glyph = struct { w: u16, h: u16, left: i32, top: i32, data: []u8 };
+    const slots = 1024;
+    const max_load = 768;
+    var used: [slots]bool = [_]bool{false} ** slots;
+    var keys: [slots]u64 = undefined;
+    var table: [slots]Glyph = undefined;
+    var count: usize = 0;
+    var scratch: [64 * 1024]u8 = undefined; // for glyphs that do not get cached
+
+    fn keyOf(cp: u21, px16: u32, bold: bool) u64 {
+        return @as(u64, cp) | @as(u64, px16) << 24 | @as(u64, @intFromBool(bold)) << 63;
+    }
+
+    fn get(face: c.FT_Face, cp: u21, px: f32, px16: u32, bold: bool, size_set: *bool) ?Glyph {
+        const key = keyOf(cp, px16, bold);
+        var h: usize = @intCast((key *% 0x9E3779B97F4A7C15) >> 54); // top 10 bits
+        var probes: usize = 0;
+        while (used[h] and probes < slots) : (probes += 1) {
+            if (keys[h] == key) return table[h];
+            h = (h + 1) & (slots - 1);
+        }
+
+        if (!size_set.*) {
+            _ = c.FT_Set_Char_Size(face, 0, @intFromFloat(px * 64), 72, 72);
+            size_set.* = true;
+        }
+        if (c.FT_Load_Char(face, cp, c.FT_LOAD_RENDER | c.FT_LOAD_NO_HINTING) != 0) return null;
+        const slot = face.*.glyph;
+        const bm = slot.*.bitmap;
+        if (bm.pixel_mode != c.FT_PIXEL_MODE_GRAY and bm.width * bm.rows != 0) return null;
+        const w: usize = bm.width;
+        const rows: usize = bm.rows;
+        const pitch: usize = @intCast(@abs(bm.pitch));
+        const size = w * rows;
+        const cacheable = count < max_load and !used[h] and probes < slots;
+        var out: []u8 = undefined;
+        if (cacheable) {
+            out = std.heap.c_allocator.alloc(u8, size) catch return null;
+        } else if (size <= scratch.len) {
+            out = scratch[0..size];
+        } else return null;
+        for (0..rows) |r| @memcpy(out[r * w ..][0..w], bm.buffer[r * pitch ..][0..w]);
+        const g = Glyph{ .w = @intCast(w), .h = @intCast(rows), .left = slot.*.bitmap_left, .top = slot.*.bitmap_top, .data = out };
+        if (cacheable) {
+            used[h] = true;
+            keys[h] = key;
+            table[h] = g;
+            count += 1;
+        }
+        return g;
+    }
+};
+
 pub const Canvas = struct {
     buf: []u32,
     w: u16,
@@ -163,7 +220,8 @@ pub const Canvas = struct {
     /// Falls back to the 8x16 bitmap font when no TTF could be loaded. Returns the end x.
     pub fn textAt(cv: *Canvas, x0: i32, base: i32, s: []const u8, color: u32, px: f32, bold: bool) i32 {
         const face = ttf.get(bold) orelse return cv.bitmapText(x0, base - 12, s, color, @max(1, @as(i32, @intFromFloat(px / 13.3 + 0.5))), bold);
-        _ = c.FT_Set_Char_Size(face, 0, @intFromFloat(px * 64), 72, 72);
+        const px16: u32 = @intFromFloat(@round(px * 16));
+        var size_set = false; // FreeType's size is only touched on a cache miss
         const adv = px * 0.6;
         var fx: f32 = @floatFromInt(x0);
         var i: usize = 0;
@@ -179,21 +237,19 @@ pub const Canvas = struct {
             const gx: i32 = @intFromFloat(@round(fx));
             fx += adv;
             if (cp == ' ') continue;
-            if (c.FT_Load_Char(face, cp, c.FT_LOAD_RENDER | c.FT_LOAD_NO_HINTING) != 0) continue;
-            const g = face.*.glyph;
-            const bm = g.*.bitmap;
-            const ox = gx + g.*.bitmap_left;
-            const oy = base - g.*.bitmap_top;
-            const pitch: usize = @intCast(bm.pitch);
-            for (0..bm.rows) |r| {
+            const g = glyphs.get(face, cp, px, px16, bold, &size_set) orelse continue;
+            const ox = gx + g.left;
+            const oy = base - g.top;
+            for (0..g.h) |r| {
                 const yy = oy + @as(i32, @intCast(r));
                 if (yy < 0 or yy >= cv.h) continue;
-                for (0..bm.width) |q| {
+                const row = @as(usize, @intCast(yy)) * cv.w;
+                for (0..g.w) |q| {
                     const xx = ox + @as(i32, @intCast(q));
                     if (xx < 0 or xx >= cv.w) continue;
-                    const a = bm.buffer[r * pitch + q];
+                    const a = g.data[r * g.w + q];
                     if (a == 0) continue;
-                    const idx = @as(usize, @intCast(yy)) * cv.w + @as(usize, @intCast(xx));
+                    const idx = row + @as(usize, @intCast(xx));
                     cv.buf[idx] = blend(cv.buf[idx], color, @as(f32, @floatFromInt(a)) / 255.0);
                 }
             }
@@ -290,6 +346,8 @@ pub const Canvas = struct {
     }
 };
 
+var rect_scratch: [16384]u32 = undefined; // flushRect staging (64 KB)
+
 pub const Surface = struct {
     conn: *c.xcb_connection_t,
     win: c.xcb_window_t,
@@ -369,6 +427,18 @@ pub const Surface = struct {
     }
 
     /// Push the canvas to the window (also used to answer Expose).
+    /// Push only a sub-rectangle (e.g. the area where the workspace pill moves).
+    pub fn flushRect(s: *Surface, x: u16, y: u16, w: u16, h: u16) void {
+        if (x >= s.cv.w or y >= s.cv.h) return;
+        const rw: usize = @min(w, s.cv.w - x);
+        const rh: usize = @min(h, s.cv.h - y);
+        if (rw * rh > rect_scratch.len) return s.flush();
+        for (0..rh) |r| @memcpy(rect_scratch[r * rw ..][0..rw], s.cv.buf[(y + r) * s.cv.w + x ..][0..rw]);
+        const bytes = std.mem.sliceAsBytes(rect_scratch[0 .. rw * rh]);
+        _ = c.xcb_put_image(s.conn, c.XCB_IMAGE_FORMAT_Z_PIXMAP, s.win, s.gc, @intCast(rw), @intCast(rh), @intCast(x), @intCast(y), 0, s.depth, @intCast(bytes.len), bytes.ptr);
+        _ = c.xcb_flush(s.conn);
+    }
+
     pub fn flush(s: *Surface) void {
         // Keep every PutImage well under the 256K request limit even on wide surfaces.
         const rows_per: usize = @max(1, 200_000 / (@as(usize, s.cv.w) * 4));

@@ -5,7 +5,6 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const store_mod = @import("store.zig");
 const panel = @import("panel.zig");
-const sys = @import("sys.zig");
 
 const Store = store_mod.Store;
 
@@ -228,7 +227,6 @@ pub const Dbus = struct {
         const s = &st.status;
         s.net = .none;
         s.net_len = 0;
-        s.net_pct = -1;
         defer s.version +%= 1;
         const bus = d.system orelse return;
 
@@ -255,7 +253,6 @@ pub const Dbus = struct {
                 s.net_len = store_mod.sanitize(&s.net_name, std.mem.span(id));
             }
             s.net = .wifi;
-            s.net_pct = sys.wifiQuality();
         } else {
             s.net = .eth;
         }

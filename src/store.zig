@@ -13,7 +13,6 @@ pub const Status = struct {
     net: Net = .none,
     net_name: [32]u8 = undefined,
     net_len: u8 = 0,
-    net_pct: i32 = -1,
 
     pub fn name(s: *const Status) []const u8 {
         return s.net_name[0..s.net_len];

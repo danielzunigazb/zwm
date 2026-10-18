@@ -17,7 +17,11 @@ pub const Bar = struct {
     last_sig: u64 = 0,
     pill: f32 = -1, // x of the active-workspace pill; slides between slots
     pill_moving: bool = false,
+    last_static: u64 = 0, // signature of everything except the pill
+    last_pill: i32 = -1000,
     bat_path: ?[*:0]const u8 = null,
+    bat: Battery = .{},
+    bat_read: i64 = 0, // when `bat` was read (unix s): sysfs is only touched every few seconds
 
     pub fn init(conn: *c.xcb_connection_t, screen: *const c.xcb_screen_t) !Bar {
         const gap: u16 = cfg.gap;
@@ -43,12 +47,16 @@ pub const Bar = struct {
         var now: c.time_t = c.time(null);
         var tm: c.struct_tm = undefined;
         _ = c.localtime_r(&now, &tm);
-        const bat = bar.battery();
+        const bat = bar.battery(now);
 
         var sig: u64 = @as(u64, @intCast(cur)) | @as(u64, occupied) << 8 | @as(u64, @intCast(@divFloor(now, 60))) << 16;
-        sig = std.hash.Wyhash.hash(sig, std.mem.asBytes(&[_]i64{ bat.pct, @intFromBool(bat.charging), st.version, anim.round(bar.pill * 4) }));
-        if (!force and sig == bar.last_sig) return;
-        bar.last_sig = sig;
+        sig = std.hash.Wyhash.hash(sig, std.mem.asBytes(&[_]i64{ bat.pct, @intFromBool(bat.charging), st.version }));
+        const pill_key = anim.round(bar.pill * 4);
+        if (!force and sig == bar.last_static and pill_key == bar.last_pill) return;
+        // Only the pill moved (a gliding workspace switch): repaint, but push just its strip.
+        const full = force or sig != bar.last_static;
+        bar.last_static = sig;
+        bar.last_pill = pill_key;
 
         const cv = &bar.surf.cv;
         const w: i32 = cv.w;
@@ -98,7 +106,7 @@ pub const Bar = struct {
             _ = item(cv, rx, .volume, 14, v, if (st.muted) cfg.fg_dim else cfg.fg);
         }
 
-        bar.surf.flush();
+        if (full) bar.surf.flush() else bar.surf.flushRect(0, 0, 6 + cfg.workspaces * 30, cfg.bar_h);
     }
 
     /// Draw "icon value" ending at `right`; returns the x where the next item should end.
@@ -114,7 +122,14 @@ pub const Bar = struct {
 
     const Battery = struct { pct: i32 = -1, charging: bool = false };
 
-    fn battery(bar: *Bar) Battery {
+    fn battery(bar: *Bar, now: i64) Battery {
+        if (bar.bat_read != 0 and now - bar.bat_read < 20 and now >= bar.bat_read) return bar.bat;
+        bar.bat_read = now;
+        bar.bat = bar.readBattery();
+        return bar.bat;
+    }
+
+    fn readBattery(bar: *Bar) Battery {
         const base = bar.bat_path orelse return .{};
         var path: [160]u8 = undefined;
         var buf: [16]u8 = undefined;

@@ -47,6 +47,8 @@ const WM = struct {
     ghosts: [Tree.max_leaves]Ghost = undefined,
     n_ghosts: usize = 0,
     animating: bool = false,
+    vol: sys.Volume = .{},
+    apps_warm: bool = false,
     last_ns: i64 = 0,
 
     fn atom(conn: *c.xcb_connection_t, name: []const u8) c.xcb_atom_t {
@@ -526,10 +528,7 @@ const WM = struct {
                 .music_toggle => wm.dbus.control("PlayPause"),
                 .music_next => wm.dbus.control("Next"),
                 .music_prev => wm.dbus.control("Previous"),
-                .volume => {
-                    sys.runWait(b.cmd);
-                    sys.readVolume(&wm.store.status);
-                },
+                .volume => wm.vol.request(b.cmd),
             }
             return;
         }
@@ -644,8 +643,8 @@ const WM = struct {
         const minute = minuteNow();
         if (minute != wm.last_minute) {
             wm.last_minute = minute;
-            sys.readVolume(&wm.store.status);
-            wm.store.net_dirty = true; // signal quality drifts without a NM state change
+            wm.vol.request(null);
+            wm.store.net_dirty = true; // e.g. ethernet plugged in while connected: no StateChanged
         }
         if (wm.store.music_dirty) wm.dbus.refreshMusic();
         if (wm.store.net_dirty) wm.dbus.refreshNet();
@@ -675,10 +674,23 @@ const WM = struct {
         return @intCast(@max(ms, 0));
     }
 
+    /// ~/.config/zwm/autostart, once per session (the session script sets ZWM_AUTOSTART only for the
+    /// first WM launch), and only now that the WM owns the screen so its windows get tiled.
+    fn runAutostart(wm: *WM) void {
+        _ = wm;
+        const v = c.getenv("ZWM_AUTOSTART") orelse return;
+        const on = v[0] == '1';
+        _ = c.unsetenv("ZWM_AUTOSTART"); // not for the apps we start
+        if (on) sys.spawn("f=\"${XDG_CONFIG_HOME:-$HOME/.config}/zwm/autostart\"; [ -x \"$f\" ] && exec \"$f\"");
+    }
+
     fn run(wm: *WM) void {
-        var pfd: [3]c.struct_pollfd = undefined;
+        var pfd: [4]c.struct_pollfd = undefined;
         wm.last_minute = minuteNow();
         wm.redrawAll(true);
+        _ = c.xcb_flush(wm.conn); // first paint before anything slow (volume probe, app scan)
+        wm.vol.request(null);
+        wm.runAutostart();
         while (wm.running) {
             while (c.xcb_poll_for_event(wm.conn)) |ev| {
                 defer std.c.free(ev);
@@ -686,6 +698,7 @@ const WM = struct {
             }
             if (c.xcb_connection_has_error(wm.conn) != 0) break;
             wm.dbus.process();
+            wm.vol.service(&wm.store.status);
             const now = panel_mod.nowMs();
             wm.refreshData(now);
 
@@ -699,8 +712,15 @@ const WM = struct {
             wm.redrawAll(false);
             _ = c.xcb_flush(wm.conn);
             if (!wm.running) break;
+            if (!wm.apps_warm and !wm.animating) {
+                // First idle moment: scan the .desktop files now so the first Alt+Space is instant.
+                wm.apps_warm = true;
+                wm.launcher.db.load();
+            }
             pfd[0] = .{ .fd = c.xcb_get_file_descriptor(wm.conn), .events = c.POLLIN, .revents = 0 };
-            const n = 1 + wm.dbus.pollFill(pfd[1..]);
+            const n0 = 1 + wm.dbus.pollFill(pfd[1..3]);
+            pfd[n0] = .{ .fd = wm.vol.pollFd(), .events = c.POLLIN, .revents = 0 }; // -1 = ignored by poll
+            const n = n0 + 1;
             if (wm.animating) {
                 _ = anim.waitUntil(pfd[0..@intCast(n)], t0 + anim.frame_ns);
             } else {
@@ -758,9 +778,7 @@ pub fn main() !void {
     };
     wm.grabKeys();
     wm.dbus.connect(&wm.store);
-    wm.launcher.db.load(); // warm the app list so the first Alt+Space does not stall
     wm.adopt();
-    sys.readVolume(&wm.store.status);
     _ = c.xcb_flush(conn);
     wm.run();
 }

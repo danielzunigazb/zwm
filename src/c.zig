@@ -5,6 +5,7 @@ pub const c = @cImport({
     @cInclude("systemd/sd-bus.h");
     @cInclude("ft2build.h");
     @cInclude("freetype/freetype.h");
+    @cInclude("errno.h");
     @cInclude("unistd.h");
     @cInclude("sys/stat.h");
     @cInclude("stdlib.h");

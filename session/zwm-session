@@ -1,11 +1,13 @@
 #!/bin/sh
-# zwm X11 session: prepare the environment, then replace this shell with the WM.
+# zwm X11 session. Kept deliberately thin: every external process here is time before the desktop
+# appears, so only what must finish first runs in the foreground.
 
 export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=zwm
 export XDG_SESSION_DESKTOP=zwm
 
 # The WM and the apps it starts need a session bus (notifications, MPRIS, NetworkManager).
+# ($(id -u) only runs when XDG_RUNTIME_DIR is unset.)
 runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && [ -S "$runtime/bus" ]; then
     export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
@@ -14,42 +16,45 @@ if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && command -v dbus-run-session >/dev/null 
     exec dbus-run-session -- "$0" "$@"
 fi
 
+# Nothing below blocks the WM except xrdb, which must be done before the first terminal opens.
 # Let D-Bus-activated and systemd user services see this display.
 command -v dbus-update-activation-environment >/dev/null 2>&1 &&
-    dbus-update-activation-environment --systemd DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+    dbus-update-activation-environment --systemd DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE &
 
 # Without this X shows its default "X" cursor on the empty desktop.
-command -v xsetroot >/dev/null 2>&1 && xsetroot -cursor_name left_ptr
+command -v xsetroot >/dev/null 2>&1 && xsetroot -cursor_name left_ptr &
 
 if command -v xrdb >/dev/null 2>&1; then
-    # Bundled xterm theme first, so ~/.Xresources can override it.
-    for f in /usr/local/share/zwm/zwm.Xresources "$(dirname "$0")/zwm.Xresources"; do
-        [ -f "$f" ] && { xrdb -merge "$f"; break; }
+    # Bundled xterm theme first (plain resources: no need for the cpp pass), so ~/.Xresources wins.
+    for f in /usr/local/share/zwm/zwm.Xresources "${0%/*}/zwm.Xresources"; do
+        [ -f "$f" ] && { xrdb -nocpp -merge "$f"; break; }
     done
+    [ -f "$HOME/.Xresources" ] && xrdb -merge "$HOME/.Xresources"
 fi
-
-[ -f "$HOME/.Xresources" ] && command -v xrdb >/dev/null 2>&1 && xrdb -merge "$HOME/.Xresources"
-
-# Put your own startup (polkit agent, wallpaper, picom, ...) in here.
-autostart="${XDG_CONFIG_HOME:-$HOME/.config}/zwm/autostart"
-[ -x "$autostart" ] && "$autostart" &
 
 # Log next to the other per-user state, and restart the WM if it crashes (it re-adopts the windows
 # that are still open). A clean exit - the quit binding - ends the session.
 state="${XDG_STATE_HOME:-$HOME/.local/state}/zwm"
-mkdir -p "$state" 2>/dev/null
+[ -d "$state" ] || mkdir -p "$state" 2>/dev/null
 log="$state/zwm.log"
-[ -f "$log" ] && [ "$(wc -c <"$log")" -gt 1048576 ] && mv -f "$log" "$log.old"
+if [ -s "$log" ] && [ "$(wc -c <"$log")" -gt 1048576 ]; then mv -f "$log" "$log.old"; fi
 
+# Seconds since boot, without forking `date`.
+now() { read -r up _ </proc/uptime; echo "${up%%.*}"; }
+
+# The WM itself runs ~/.config/zwm/autostart right after its first frame, and only on this first
+# launch (ZWM_AUTOSTART): a crash restart must not open everything a second time.
+ZWM_AUTOSTART=1; export ZWM_AUTOSTART
 crashes=0
 while :; do
-    started=$(date +%s)
+    started=$(now)
     zwm >>"$log" 2>&1
     rc=$?
-    [ "$rc" -eq 0 ] && exit 0
-    echo "[$(date '+%F %T')] zwm exited with status $rc" >>"$log"
+    case "$rc" in 0 | 130 | 143) exit "$rc" ;; esac # quit binding, ^C, SIGTERM: deliberate, no restart
+    unset ZWM_AUTOSTART
+    echo "[uptime ${started}s+] zwm exited with status $rc" >>"$log"
     # More than 5 crashes inside a short window: give up instead of looping forever.
-    [ $(( $(date +%s) - started )) -gt 30 ] && crashes=0
+    [ $(( $(now) - started )) -gt 30 ] && crashes=0
     crashes=$((crashes + 1))
     [ "$crashes" -ge 5 ] && exit "$rc"
     sleep 0.3
