@@ -1,0 +1,15 @@
+#!/bin/sh
+# zwm autostart: runs in the background at login (installed to ~/.config/zwm/autostart).
+# Opens Claude Code in ~/Proyectos, resuming the last conversation there.
+
+# The session script starts this just before the WM; give the WM a moment to take the root window
+# so the terminal gets tiled instead of appearing unmanaged.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -x zwm >/dev/null 2>&1 && break
+    sleep 0.3
+done
+sleep 0.4
+
+PATH="$HOME/.local/bin:$PATH"
+cd "$HOME/Proyectos" 2>/dev/null || cd "$HOME"
+exec xterm -T claude -e sh -c 'claude --continue || exec claude'

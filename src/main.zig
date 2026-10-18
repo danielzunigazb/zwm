@@ -163,8 +163,12 @@ const WM = struct {
         const k = cfg.k_window;
         const m1 = anim.settle(&node.cx, @floatFromInt(node.tx), dt, k);
         const m2 = anim.settle(&node.cy, @floatFromInt(node.ty), dt, k);
-        const m3 = anim.settle(&node.cw, @floatFromInt(node.tw), dt, k);
-        const m4 = anim.settle(&node.ch, @floatFromInt(node.th), dt, k);
+        // Size is applied at once, only position glides: every size change is a SIGWINCH, and a
+        // shell redraws its prompt on each one (animating size filled terminals with prompts).
+        node.cw = @floatFromInt(node.tw);
+        node.ch = @floatFromInt(node.th);
+        const m3 = false;
+        const m4 = false;
         const nx = anim.round(node.cx);
         const ny = anim.round(node.cy);
         const nw: u32 = @intCast(@max(1, anim.round(node.cw)));
@@ -431,6 +435,7 @@ const WM = struct {
                 .workspace => wm.switchTo(b.n),
                 .send_to => wm.sendTo(b.n),
                 .toggle_panel => wm.panel.toggle(&wm.store),
+                .spawn => sys.spawn(b.cmd),
                 .launcher => if (wm.syms) |syms| {
                     _ = wm.launcher.open(syms);
                 },

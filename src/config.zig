@@ -18,6 +18,10 @@ pub const fg_bright: u32 = 0xeceff4;
 pub const fg_dim: u32 = 0xa9b3c6;
 pub const terminal = "xterm";
 
+// Claude Code in a fresh terminal, rooted at ~/Proyectos. (claude lives in ~/.local/bin, which a
+// display-manager session does not always have on PATH.)
+pub const claude_cmd = "xterm -T claude -e sh -c 'cd \"$HOME/Proyectos\" 2>/dev/null; PATH=\"$HOME/.local/bin:$PATH\" exec claude'";
+
 // Animation. Frames are paced at anim_hz while something moves (idle = no wakeups).
 // The k values are decay rates in 1/s: larger = snappier (95% of the way in ~3/k s).
 pub const anim_hz: i64 = 144;
@@ -31,7 +35,7 @@ pub const k_launcher: f32 = 30;
 pub const Dir4 = enum { left, up, right, down };
 pub const workspaces = 5;
 
-pub const Action = enum { spawn_terminal, close, quit, focus, swap, resize, workspace, send_to, toggle_panel, music_toggle, music_next, music_prev, volume, launcher };
+pub const Action = enum { spawn_terminal, close, quit, focus, swap, resize, workspace, send_to, toggle_panel, music_toggle, music_next, music_prev, volume, launcher, spawn };
 
 // Extra modifier bits on top of mod_mask.
 const shift: u16 = 1;
@@ -56,6 +60,7 @@ pub const binds = base ++ wsBinds(0, .workspace) ++ wsBinds(shift, .send_to);
 const base = [_]Bind{
     .{ .keysym = 0xff0d, .action = .spawn_terminal }, // Return
     .{ .keysym = 'q', .action = .close },
+    .{ .keysym = 'c', .action = .spawn, .cmd = claude_cmd }, // Super+C: new Claude session
     .{ .keysym = ' ', .action = .toggle_panel },
     .{ .mod = false, .extra = alt, .keysym = ' ', .action = .launcher }, // Alt+Space
 
