@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("xcb", .{});
     mod.linkSystemLibrary("xcb-keysyms", .{});
     mod.linkSystemLibrary("xcb-shape", .{});
+    mod.linkSystemLibrary("libsystemd", .{}); // sd-bus
 
     const exe = b.addExecutable(.{ .name = "wm", .root_module = mod });
     b.installArtifact(exe);

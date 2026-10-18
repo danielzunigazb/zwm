@@ -11,6 +11,7 @@ pub const resize_step: f32 = 0.03;
 pub const bar_h: u16 = 32;
 pub const bar_radius: u16 = 10;
 pub const bar_bg: u32 = 0x3b4252;
+pub const desktop_bg: u32 = 0x2e3440;
 pub const accent: u32 = 0x88c0d0;
 pub const fg: u32 = 0xd8dee9;
 pub const fg_bright: u32 = 0xeceff4;
@@ -20,13 +21,14 @@ pub const terminal = "xterm";
 pub const Dir4 = enum { left, up, right, down };
 pub const workspaces = 5;
 
-pub const Action = enum { spawn_terminal, close, quit, focus, swap, resize, workspace, send_to };
+pub const Action = enum { spawn_terminal, close, quit, focus, swap, resize, workspace, send_to, toggle_panel, music_toggle, music_next, music_prev, volume };
 
 // Extra modifier bits on top of mod_mask.
 const shift: u16 = 1;
 const alt: u16 = 8;
 
-pub const Bind = struct { extra: u16 = 0, keysym: u32, action: Action, dir: Dir4 = .left, n: u8 = 0 };
+// `mod = false` grabs the key without the Super modifier (media keys). `cmd` is for .volume.
+pub const Bind = struct { extra: u16 = 0, mod: bool = true, keysym: u32, action: Action, dir: Dir4 = .left, n: u8 = 0, cmd: [*:0]const u8 = "" };
 
 const left = 0xff51;
 const up = 0xff52;
@@ -44,6 +46,15 @@ pub const binds = base ++ wsBinds(0, .workspace) ++ wsBinds(shift, .send_to);
 const base = [_]Bind{
     .{ .keysym = 0xff0d, .action = .spawn_terminal }, // Return
     .{ .keysym = 'q', .action = .close },
+    .{ .keysym = ' ', .action = .toggle_panel },
+
+    // Media keys (no modifier): XF86Audio{Mute,LowerVolume,RaiseVolume,Prev,Play,Next}.
+    .{ .mod = false, .keysym = 0x1008ff12, .action = .volume, .cmd = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle" },
+    .{ .mod = false, .keysym = 0x1008ff11, .action = .volume, .cmd = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-" },
+    .{ .mod = false, .keysym = 0x1008ff13, .action = .volume, .cmd = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+" },
+    .{ .mod = false, .keysym = 0x1008ff16, .action = .music_prev },
+    .{ .mod = false, .keysym = 0x1008ff14, .action = .music_toggle },
+    .{ .mod = false, .keysym = 0x1008ff17, .action = .music_next },
     .{ .extra = shift, .keysym = 'e', .action = .quit },
 
     .{ .keysym = left, .action = .focus, .dir = .left },

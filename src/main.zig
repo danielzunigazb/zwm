@@ -3,6 +3,10 @@ const cfg = @import("config.zig");
 const tree_mod = @import("tree.zig");
 const c = @import("c.zig").c;
 const Bar = @import("bar.zig").Bar;
+const panel_mod = @import("panel.zig");
+const store_mod = @import("store.zig");
+const dbus_mod = @import("dbus.zig");
+const sys = @import("sys.zig");
 
 const Tree = tree_mod.Tree;
 const Node = tree_mod.Node;
@@ -16,6 +20,13 @@ const WM = struct {
     area: Rect,
     tree: Tree,
     bar: Bar,
+    widget: panel_mod.Widget,
+    panel: panel_mod.Panel,
+    toasts: panel_mod.Toasts,
+    store: store_mod.Store = .{},
+    dbus: dbus_mod.Dbus = .{},
+    last_minute: i64 = 0,
+    last_pos_ms: i64 = 0,
     focus: ?*Node = null,
     // `tree`/`focus` are the live workspace; the others sit here (saved[cur] is stale).
     saved: [cfg.workspaces]Saved,
@@ -41,7 +52,7 @@ const WM = struct {
             const kc = c.xcb_key_symbols_get_keycode(syms, b.keysym) orelse continue;
             defer std.c.free(kc);
             wm.keycodes[i] = kc[0];
-            const m = cfg.mod_mask | b.extra;
+            const m = (if (b.mod) cfg.mod_mask else 0) | b.extra;
             for (extra) |e| {
                 _ = c.xcb_grab_key(wm.conn, 1, wm.root, m | e, kc[0], c.XCB_GRAB_MODE_ASYNC, c.XCB_GRAB_MODE_ASYNC);
             }
@@ -185,20 +196,6 @@ const WM = struct {
         _ = c.xcb_flush(wm.conn);
     }
 
-    fn spawn(cmd: [*:0]const u8) void {
-        const pid = c.fork();
-        if (pid == 0) {
-            _ = c.setsid();
-            if (c.fork() == 0) {
-                const argv = [_:null]?[*:0]const u8{cmd};
-                _ = c.execvp(cmd, @ptrCast(&argv));
-            }
-            c._exit(0);
-        } else if (pid > 0) {
-            _ = c.waitpid(pid, null, 0);
-        }
-    }
-
     /// Closest leaf in direction `dir` from the focused one (must overlap on the other axis).
     fn neighbor(wm: *WM, dir: cfg.Dir4) ?*Node {
         const cur = wm.focus orelse return null;
@@ -261,10 +258,10 @@ const WM = struct {
     fn onKey(wm: *WM, ev: *c.xcb_key_press_event_t) void {
         const state = ev.state & ~@as(u16, 2 | 16); // drop lock bits
         for (cfg.binds, 0..) |b, i| {
-            const m = cfg.mod_mask | b.extra;
+            const m = (if (b.mod) cfg.mod_mask else 0) | b.extra;
             if (ev.detail != wm.keycodes[i] or state != m) continue;
             switch (b.action) {
-                .spawn_terminal => spawn(cfg.terminal),
+                .spawn_terminal => sys.spawn(cfg.terminal),
                 .close => wm.closeFocused(),
                 .quit => wm.running = false,
                 .focus => if (wm.neighbor(b.dir)) |n| wm.setFocus(n),
@@ -272,6 +269,17 @@ const WM = struct {
                 .resize => wm.resizeDir(b.dir),
                 .workspace => wm.switchTo(b.n),
                 .send_to => wm.sendTo(b.n),
+                .toggle_panel => {
+                    wm.panel.toggle(&wm.store);
+                    wm.toasts.last_version -%= 1; // toasts shift aside when the panel opens
+                },
+                .music_toggle => wm.dbus.control("PlayPause"),
+                .music_next => wm.dbus.control("Next"),
+                .music_prev => wm.dbus.control("Previous"),
+                .volume => {
+                    sys.runWait(b.cmd);
+                    sys.readVolume(&wm.store.status);
+                },
             }
             return;
         }
@@ -306,15 +314,24 @@ const WM = struct {
 
     fn handle(wm: *WM, ev: *c.xcb_generic_event_t) void {
         switch (ev.response_type & 0x7f) {
-            c.XCB_MAP_REQUEST => wm.manage(@as(*c.xcb_map_request_event_t, @ptrCast(@alignCast(ev))).window),
+            c.XCB_MAP_REQUEST => {
+                wm.manage(@as(*c.xcb_map_request_event_t, @ptrCast(@alignCast(ev))).window);
+                wm.panel.raise();
+                wm.toasts.raise();
+            },
             c.XCB_UNMAP_NOTIFY => wm.onUnmap(@as(*c.xcb_unmap_notify_event_t, @ptrCast(@alignCast(ev))).window),
             c.XCB_DESTROY_NOTIFY => wm.unmanage(@as(*c.xcb_destroy_notify_event_t, @ptrCast(@alignCast(ev))).window),
             c.XCB_CONFIGURE_REQUEST => wm.onConfigureRequest(@ptrCast(@alignCast(ev))),
             c.XCB_KEY_PRESS => wm.onKey(@ptrCast(@alignCast(ev))),
             c.XCB_EXPOSE => {
                 const e: *c.xcb_expose_event_t = @ptrCast(@alignCast(ev));
-                if (e.window == wm.bar.win and e.count == 0) wm.redrawBar(true);
+                if (e.count != 0) return;
+                if (e.window == wm.bar.surf.win) wm.bar.surf.flush();
+                wm.widget.expose(e.window);
+                wm.panel.expose(e.window);
+                wm.toasts.expose(e.window);
             },
+            c.XCB_BUTTON_PRESS => wm.onClick(@ptrCast(@alignCast(ev))),
             c.XCB_ENTER_NOTIFY => {
                 const e: *c.xcb_enter_notify_event_t = @ptrCast(@alignCast(ev));
                 if (wm.tree.find(e.event)) |leaf| if (leaf != wm.focus) wm.setFocus(leaf);
@@ -329,30 +346,79 @@ const WM = struct {
             const root = if (i == wm.cur) wm.tree.root else wm.saved[i].tree.root;
             if (root != null) occupied |= @as(u8, 1) << @intCast(i);
         }
-        wm.bar.draw(wm.cur, occupied, force);
+        wm.bar.draw(wm.cur, occupied, &wm.store.status, force);
     }
 
-    /// Sleep budget for poll(): the clock only changes once a minute.
-    fn msToNextMinute() c_int {
+    fn onClick(wm: *WM, e: *c.xcb_button_press_event_t) void {
+        if (wm.toasts.idAt(e.event)) |id| {
+            wm.store.dropToast(id);
+        } else if (wm.panel.hit(e.event, e.event_x, e.event_y)) |click| switch (click) {
+            .prev => wm.dbus.control("Previous"),
+            .play => wm.dbus.control("PlayPause"),
+            .next => wm.dbus.control("Next"),
+            .dismiss => |id| wm.store.dismiss(id),
+        };
+    }
+
+    fn minuteNow() i64 {
+        return @divFloor(@as(i64, c.time(null)), 60);
+    }
+
+    /// Pull fresh data from D-Bus / the system when something flagged it (or a minute passed).
+    fn refreshData(wm: *WM, now: i64) void {
+        const minute = minuteNow();
+        if (minute != wm.last_minute) {
+            wm.last_minute = minute;
+            sys.readVolume(&wm.store.status);
+            wm.store.net_dirty = true; // signal quality drifts without a NM state change
+        }
+        if (wm.store.music_dirty) wm.dbus.refreshMusic();
+        if (wm.store.net_dirty) wm.dbus.refreshNet();
+        if (wm.panel.visible() and wm.store.music.playing and now - wm.last_pos_ms >= 1000) {
+            wm.last_pos_ms = now;
+            wm.dbus.refreshPosition();
+        }
+    }
+
+    fn redrawAll(wm: *WM, force: bool) void {
+        const now = panel_mod.nowMs();
+        wm.redrawBar(force);
+        wm.widget.draw(&wm.store, force);
+        wm.toasts.sync(&wm.store, now, wm.panel.visible());
+        wm.panel.draw(&wm.store, force);
+    }
+
+    /// poll() budget: the clock only changes once a minute, unless a toast, the
+    /// progress bar or a D-Bus timeout needs us sooner.
+    fn sleepMs(wm: *WM, now: i64) c_int {
         var ts: c.struct_timespec = undefined;
         _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
-        const ms: i64 = @mod(@as(i64, ts.tv_sec), 60) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
-        return @intCast(60_000 - ms + 20);
+        var ms: i64 = 60_000 - (@mod(@as(i64, ts.tv_sec), 60) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000)) + 20;
+        if (panel_mod.Toasts.nextExpiry(&wm.store, now)) |e| ms = @min(ms, e + 5);
+        if (wm.panel.visible() and wm.store.music.playing) ms = @min(ms, 1000);
+        if (wm.dbus.timeoutMs()) |t| ms = @min(ms, t);
+        return @intCast(@max(ms, 0));
     }
 
     fn run(wm: *WM) void {
-        var pfd = c.struct_pollfd{ .fd = c.xcb_get_file_descriptor(wm.conn), .events = c.POLLIN, .revents = 0 };
-        wm.redrawBar(true);
+        var pfd: [3]c.struct_pollfd = undefined;
+        wm.last_minute = minuteNow();
+        wm.redrawAll(true);
         while (wm.running) {
             while (c.xcb_poll_for_event(wm.conn)) |ev| {
                 defer std.c.free(ev);
                 wm.handle(ev);
             }
             if (c.xcb_connection_has_error(wm.conn) != 0) break;
-            wm.redrawBar(false);
+            wm.dbus.process();
+            const now = panel_mod.nowMs();
+            wm.refreshData(now);
+            wm.redrawAll(false);
             _ = c.xcb_flush(wm.conn);
             if (!wm.running) break;
-            _ = c.poll(&pfd, 1, msToNextMinute());
+            pfd[0] = .{ .fd = c.xcb_get_file_descriptor(wm.conn), .events = c.POLLIN, .revents = 0 };
+            const n = 1 + wm.dbus.pollFill(pfd[1..]);
+            _ = c.poll(&pfd, @intCast(n), wm.sleepMs(now));
         }
     }
 };
@@ -372,18 +438,28 @@ pub fn main() !void {
         return error.AnotherWmRunning;
     }
 
+    // Desktop colour; the desktop widget window uses the same one.
+    const bg = [_]u32{cfg.desktop_bg};
+    _ = c.xcb_change_window_attributes(conn, screen.root, c.XCB_CW_BACK_PIXEL, &bg);
+    _ = c.xcb_clear_area(conn, 0, screen.root, 0, 0, 0, 0);
+
     var wm = WM{
         .conn = conn,
         .root = screen.root,
         // Top of the screen is taken by the bar (plus its gap).
         .area = .{ .x = 0, .y = cfg.gap + cfg.bar_h, .w = screen.width_in_pixels, .h = screen.height_in_pixels - (cfg.gap + cfg.bar_h) },
         .bar = try Bar.init(conn, &screen),
+        .widget = try panel_mod.Widget.init(conn, &screen),
+        .panel = .{ .conn = conn, .screen = screen },
+        .toasts = .{ .conn = conn, .screen = screen },
         .tree = .{ .gpa = std.heap.c_allocator },
         .saved = [_]Saved{.{ .tree = .{ .gpa = std.heap.c_allocator } }} ** cfg.workspaces,
         .wm_protocols = WM.atom(conn, "WM_PROTOCOLS"),
         .wm_delete = WM.atom(conn, "WM_DELETE_WINDOW"),
     };
     wm.grabKeys();
+    wm.dbus.connect(&wm.store);
+    sys.readVolume(&wm.store.status);
     _ = c.xcb_flush(conn);
     wm.run();
 }
