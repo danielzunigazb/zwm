@@ -6,6 +6,7 @@ const c = @import("c.zig").c;
 const gfx = @import("gfx.zig");
 const store = @import("store.zig");
 const icons = @import("icons.zig");
+const anim = @import("anim.zig");
 
 
 pub const days = [_][]const u8{ "dom", "lun", "mar", "mie", "jue", "vie", "sab" };
@@ -14,6 +15,8 @@ pub const months = [_][]const u8{ "ene", "feb", "mar", "abr", "may", "jun", "jul
 pub const Bar = struct {
     surf: gfx.Surface,
     last_sig: u64 = 0,
+    pill: f32 = -1, // x of the active-workspace pill; slides between slots
+    pill_moving: bool = false,
     bat_path: ?[*:0]const u8 = null,
 
     pub fn init(conn: *c.xcb_connection_t, screen: *const c.xcb_screen_t) !Bar {
@@ -27,6 +30,14 @@ pub const Bar = struct {
         return bar;
     }
 
+    /// Slide the workspace pill toward `cur`. True while it is moving.
+    pub fn step(bar: *Bar, cur: usize, dt: f32) bool {
+        const target: f32 = @floatFromInt(6 + @as(i32, @intCast(cur)) * 30);
+        if (bar.pill < 0) bar.pill = target;
+        bar.pill_moving = anim.settle(&bar.pill, target, dt, cfg.k_pill);
+        return bar.pill_moving;
+    }
+
     /// Repaint if anything visible changed (or `force`). `occupied` has one bit per workspace.
     pub fn draw(bar: *Bar, cur: usize, occupied: u8, st: *const store.Status, force: bool) void {
         var now: c.time_t = c.time(null);
@@ -35,7 +46,7 @@ pub const Bar = struct {
         const bat = bar.battery();
 
         var sig: u64 = @as(u64, @intCast(cur)) | @as(u64, occupied) << 8 | @as(u64, @intCast(@divFloor(now, 60))) << 16;
-        sig = std.hash.Wyhash.hash(sig, std.mem.asBytes(&[_]i64{ bat.pct, @intFromBool(bat.charging), st.version }));
+        sig = std.hash.Wyhash.hash(sig, std.mem.asBytes(&[_]i64{ bat.pct, @intFromBool(bat.charging), st.version, anim.round(bar.pill * 4) }));
         if (!force and sig == bar.last_sig) return;
         bar.last_sig = sig;
 
@@ -43,18 +54,17 @@ pub const Bar = struct {
         const w: i32 = cv.w;
         cv.fill(cfg.bar_bg);
 
-        // Workspaces, left.
+        // Workspaces, left. The pill glides to the active slot; each digit fades between its
+        // normal colour and the pill's dark colour by how much of the pill covers it.
+        if (bar.pill < 0) bar.pill = @floatFromInt(6 + @as(i32, @intCast(cur)) * 30);
+        cv.roundRect(anim.round(bar.pill), 5, 26, 22, 7, cfg.accent);
         for (0..cfg.workspaces) |i| {
             const x: i32 = 6 + @as(i32, @intCast(i)) * 30;
             var digit = [1]u8{'1' + @as(u8, @intCast(i))};
             const dx = x + 13 - 3; // 12px mono glyph is 7.2px wide, centered in the 26px pill
-            if (i == cur) {
-                cv.roundRect(x, 5, 26, 22, 7, cfg.accent);
-                _ = cv.textAt(dx, 20, &digit, cfg.bar_bg, 12, true);
-            } else {
-                const col: u32 = if (occupied & (@as(u8, 1) << @intCast(i)) != 0) cfg.fg else cfg.fg_dim;
-                _ = cv.textAt(dx, 20, &digit, col, 12, false);
-            }
+            const cover = std.math.clamp(1 - @abs(bar.pill - @as(f32, @floatFromInt(x))) / 26, 0, 1);
+            const base: u32 = if (i == cur or occupied & (@as(u8, 1) << @intCast(i)) != 0) cfg.fg else cfg.fg_dim;
+            _ = cv.textAt(dx, 20, &digit, gfx.blend(base, cfg.bar_bg, cover), 12, cover > 0.5);
         }
 
         // Clock + date, centered (13px, 10px apart).

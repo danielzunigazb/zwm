@@ -6,6 +6,7 @@ const cfg = @import("config.zig");
 const c = @import("c.zig").c;
 const gfx = @import("gfx.zig");
 const icons = @import("icons.zig");
+const anim = @import("anim.zig");
 const store = @import("store.zig");
 
 const Store = store.Store;
@@ -72,25 +73,50 @@ pub const Panel = struct {
     last_sig: u64 = 0,
     hits: [24]Hit = undefined,
     n_hits: usize = 0,
+    x: f32 = 0, // animated left edge
+    y: i32 = 0,
+    closing: bool = false, // sliding out; the window goes away when it is off screen
 
+    /// Open for logic purposes (toasts shift aside): false as soon as it starts sliding out.
     pub fn visible(p: *const Panel) bool {
-        return p.surf != null;
+        return p.surf != null and !p.closing;
+    }
+
+    fn restX(p: *const Panel) f32 {
+        return @floatFromInt(@as(i32, p.screen.width_in_pixels) - cfg.gap - panel_w);
     }
 
     pub fn toggle(p: *Panel, st: *const Store) void {
-        if (p.surf) |*s| {
-            s.destroy();
-            p.surf = null;
+        if (p.surf != null) {
+            p.closing = !p.closing; // re-toggling mid-slide just reverses it
             return;
         }
         const gap: i32 = cfg.gap;
         const y: i32 = 2 * gap + cfg.bar_h;
         const h: u16 = @intCast(@as(i32, p.screen.height_in_pixels) - y - gap);
-        const x: i32 = @as(i32, p.screen.width_in_pixels) - gap - panel_w;
+        const x: i32 = @as(i32, p.screen.width_in_pixels); // starts just off the right edge
         var s = gfx.Surface.create(p.conn, &p.screen, x, y, panel_w, h, 14, c.XCB_EVENT_MASK_EXPOSURE | c.XCB_EVENT_MASK_BUTTON_PRESS, cfg.bar_bg) catch return;
         s.map();
         p.surf = s;
+        p.x = @floatFromInt(x);
+        p.y = y;
+        p.closing = false;
         p.draw(st, true);
+    }
+
+    pub fn step(p: *Panel, dt: f32) bool {
+        const s = &(p.surf orelse return false);
+        const target: f32 = if (p.closing) @floatFromInt(@as(i32, p.screen.width_in_pixels)) else p.restX();
+        const before = anim.round(p.x);
+        const moving = anim.settle(&p.x, target, dt, cfg.k_panel);
+        const nx = anim.round(p.x);
+        if (nx != before) s.move(nx, p.y);
+        if (!moving and p.closing) {
+            s.destroy();
+            p.surf = null;
+            p.closing = false;
+        }
+        return moving;
     }
 
     pub fn raise(p: *Panel) void {
@@ -282,19 +308,24 @@ pub const Widget = struct {
 // ---- notification toasts ----
 
 const max_toasts = 3;
+const max_slots = 2 * max_toasts; // visible ones plus the ones still sliding out
 const toast_w: u16 = 300;
 
-const Toast = struct { surf: gfx.Surface, id: u32 };
+const Toast = struct { surf: gfx.Surface, id: u32, hash: u64, h: i32, x: f32, y: f32, tx: f32, ty: f32, leaving: bool };
 
 pub const Toasts = struct {
     conn: *c.xcb_connection_t,
     screen: c.xcb_screen_t,
-    list: [max_toasts]?Toast = [_]?Toast{null} ** max_toasts,
-    shown_panel: bool = false,
-    last_version: u32 = 0,
+    list: [max_slots]?Toast = [_]?Toast{null} ** max_slots,
 
-    /// Rebuild the visible toast windows when the set of live toasts (or panel state) changed.
+    /// Reconcile windows with the live toasts: new ones slide in from the right, expired or
+    /// dismissed ones slide out, the rest glide to their (possibly shifted) slots. Windows are
+    /// only rebuilt when a notification's text actually changed.
     pub fn sync(t: *Toasts, st: *const Store, now: i64, panel_open: bool) void {
+        const gap: i32 = cfg.gap;
+        const sw: f32 = @floatFromInt(t.screen.width_in_pixels);
+        const rest_x: f32 = sw - @as(f32, @floatFromInt(gap + toast_w)) - (if (panel_open) @as(f32, @floatFromInt(@as(i32, panel_w) + 2 * gap)) else 0);
+
         var want: [max_toasts]u32 = undefined;
         var n: usize = 0;
         for (st.notifs[0..st.count]) |x| {
@@ -303,38 +334,72 @@ pub const Toasts = struct {
                 n += 1;
             }
         }
-        var same = panel_open == t.shown_panel;
-        for (t.list, 0..) |maybe, i| {
-            const have: ?u32 = if (maybe) |m| m.id else null;
-            const wnt: ?u32 = if (i < n) want[i] else null;
-            if (have != wnt) same = false;
-        }
-        // A replaced notification keeps its id, so also compare the list version.
-        if (same and t.last_version == st.notif_version) return;
-        t.last_version = st.notif_version;
-        t.shown_panel = panel_open;
 
+        // Toasts that are no longer wanted start leaving.
         for (&t.list) |*maybe| {
-            if (maybe.*) |*m| m.surf.destroy();
-            maybe.* = null;
+            const m = &(maybe.* orelse continue);
+            if (m.leaving) continue;
+            const still = for (want[0..n]) |id| {
+                if (id == m.id) break true;
+            } else false;
+            if (!still) {
+                m.leaving = true;
+                m.tx = sw;
+            }
         }
-        const gap: i32 = cfg.gap;
-        const x: i32 = @as(i32, t.screen.width_in_pixels) - gap - toast_w - (if (panel_open) @as(i32, panel_w) + 2 * gap else 0);
+
         var y: i32 = 2 * gap + cfg.bar_h;
-        for (0..n) |i| {
+        for (want[0..n]) |id| {
             const nt = for (st.notifs[0..st.count]) |*x2| {
-                if (x2.id == want[i]) break x2;
+                if (x2.id == id) break x2;
             } else continue;
             var lines: [2][]const u8 = undefined;
             var cut = false;
             const nl = wrap(nt.bodySlice(), 34, &lines, &cut);
-            const h: u16 = @intCast(12 + 15 + 4 + 17 + (if (nl > 0) 4 + nl * 16 else 0) + 12);
-            var s = gfx.Surface.create(t.conn, &t.screen, x, y, toast_w, h, 12, c.XCB_EVENT_MASK_EXPOSURE | c.XCB_EVENT_MASK_BUTTON_PRESS, cfg.bar_bg) catch continue;
+            const h: i32 = 12 + 15 + 4 + 17 + (if (nl > 0) 4 + @as(i32, @intCast(nl)) * 16 else 0) + 12;
+
+            var hh = std.hash.Wyhash.init(0);
+            hh.update(nt.appSlice());
+            hh.update("\x00");
+            hh.update(nt.summarySlice());
+            hh.update("\x00");
+            hh.update(nt.bodySlice());
+            const hash = hh.final();
+
+            var slot: ?*?Toast = null;
+            var free: ?*?Toast = null;
+            for (&t.list) |*maybe| {
+                if (maybe.*) |m| {
+                    if (m.id == id and !m.leaving) slot = maybe;
+                } else if (free == null) free = maybe;
+            }
+
+            var start_x = sw; // brand-new toast: enters from off screen
+            var start_y: f32 = @floatFromInt(y);
+            if (slot) |sl| {
+                const old = sl.*.?;
+                if (old.hash == hash) {
+                    sl.*.?.tx = rest_x;
+                    sl.*.?.ty = @floatFromInt(y);
+                    y += old.h + gap;
+                    continue;
+                }
+                // Text changed (a replaced notification): rebuild in place, no new slide.
+                start_x = old.x;
+                start_y = old.y;
+                var o = old;
+                o.surf.destroy();
+                sl.* = null;
+                free = sl;
+            }
+            const dst = free orelse continue;
+
+            var s = gfx.Surface.create(t.conn, &t.screen, anim.round(start_x), anim.round(start_y), toast_w, @intCast(h), 12, c.XCB_EVENT_MASK_EXPOSURE | c.XCB_EVENT_MASK_BUTTON_PRESS, cfg.bar_bg) catch continue;
             const cv = &s.cv;
             cv.fill(cfg.bar_bg);
-            if (i == 0) {
-                cv.roundRect(0, 0, toast_w, h, 12, cfg.accent);
-                cv.roundRect(2, 2, toast_w - 4, h - 4, 10, cfg.bar_bg);
+            if (id == want[0]) {
+                cv.roundRect(0, 0, toast_w, @intCast(h), 12, cfg.accent);
+                cv.roundRect(2, 2, toast_w - 4, @intCast(h - 4), 10, cfg.bar_bg);
             }
             _ = cv.textFit13(14, 23, nt.appSlice(), 34, cfg.fg_dim, false);
             _ = cv.textFit13(14, 44, nt.summarySlice(), 34, cfg.fg_bright, false);
@@ -346,9 +411,30 @@ pub const Toasts = struct {
             }
             s.map();
             s.setStack(true);
-            t.list[i] = .{ .surf = s, .id = want[i] };
+            dst.* = .{ .surf = s, .id = id, .hash = hash, .h = h, .x = start_x, .y = start_y, .tx = rest_x, .ty = @floatFromInt(y), .leaving = false };
             y += h + gap;
         }
+    }
+
+    pub fn step(t: *Toasts, dt: f32) bool {
+        var moving = false;
+        for (&t.list) |*maybe| {
+            const m = &(maybe.* orelse continue);
+            const ox = anim.round(m.x);
+            const oy = anim.round(m.y);
+            const mx = anim.settle(&m.x, m.tx, dt, cfg.k_toast);
+            const my = anim.settle(&m.y, m.ty, dt, cfg.k_toast);
+            const nx = anim.round(m.x);
+            const ny = anim.round(m.y);
+            if (nx != ox or ny != oy) m.surf.move(nx, ny);
+            if (m.leaving and !mx) {
+                m.surf.destroy();
+                maybe.* = null;
+                continue;
+            }
+            moving = moving or mx or my;
+        }
+        return moving;
     }
 
     pub fn expose(t: *Toasts, win: c.xcb_window_t) void {

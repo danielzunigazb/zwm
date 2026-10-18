@@ -18,6 +18,16 @@ pub const fg_bright: u32 = 0xeceff4;
 pub const fg_dim: u32 = 0xa9b3c6;
 pub const terminal = "xterm";
 
+// Animation. Frames are paced at anim_hz while something moves (idle = no wakeups).
+// The k values are decay rates in 1/s: larger = snappier (95% of the way in ~3/k s).
+pub const anim_hz: i64 = 144;
+pub const k_window: f32 = 26;
+pub const k_workspace: f32 = 22;
+pub const k_pill: f32 = 32;
+pub const k_panel: f32 = 24;
+pub const k_toast: f32 = 26;
+pub const k_launcher: f32 = 30;
+
 pub const Dir4 = enum { left, up, right, down };
 pub const workspaces = 5;
 

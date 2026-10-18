@@ -15,6 +15,21 @@ pub const Node = struct {
     a: ?*Node = null,
     b: ?*Node = null,
 
+    // Leaf geometry for animation (driven from main.zig): target, current and last-sent rect.
+    placed: bool = false, // `cx..` are valid (window has been configured at least once here)
+    tx: i32 = 0,
+    ty: i32 = 0,
+    tw: u32 = 1,
+    th: u32 = 1,
+    cx: f32 = 0,
+    cy: f32 = 0,
+    cw: f32 = 1,
+    ch: f32 = 1,
+    sx: i32 = 0,
+    sy: i32 = 0,
+    sw: u32 = 0,
+    sh: u32 = 0,
+
     pub fn isLeaf(n: *const Node) bool {
         return n.a == null;
     }

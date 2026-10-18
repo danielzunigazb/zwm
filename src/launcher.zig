@@ -5,6 +5,7 @@ const std = @import("std");
 const cfg = @import("config.zig");
 const c = @import("c.zig").c;
 const gfx = @import("gfx.zig");
+const anim = @import("anim.zig");
 const apps = @import("apps.zig");
 const calc = @import("calc.zig");
 
@@ -30,6 +31,7 @@ pub const Launcher = struct {
     n_match: usize = 0,
     calc_val: ?f64 = null,
     sel: usize = 0,
+    x: f32 = 0, // animated left edge: slides in from off screen on open
 
     /// Last action's payload, valid until the next key.
     cmd_buf: [320:0]u8 = [_:0]u8{0} ** 320,
@@ -66,6 +68,15 @@ pub const Launcher = struct {
         }
     }
 
+    pub fn step(l: *Launcher, dt: f32) bool {
+        const s = &(l.surf orelse return false);
+        const before = anim.round(l.x);
+        const moving = anim.settle(&l.x, @floatFromInt(cfg.gap), dt, cfg.k_launcher);
+        const nx = anim.round(l.x);
+        if (nx != before) s.move(nx, 2 * cfg.gap + cfg.bar_h);
+        return moving;
+    }
+
     fn rows(l: *const Launcher) usize {
         const n = l.n_match + @intFromBool(l.calc_val != null);
         return @max(n, 1);
@@ -83,15 +94,13 @@ pub const Launcher = struct {
     fn rebuild(l: *Launcher) void {
         const h: u16 = @intCast(pad + input_h + 10 + l.rows() * row_h + pad - 2);
         if (l.surf) |*s| {
-            if (s.cv.h == h) {
-                l.draw();
-                return;
-            }
-            s.destroy();
-            l.surf = null;
+            if (s.cv.h != h) s.resize(&l.screen, h, 14); // grow/shrink in place: no flicker while typing
+            l.draw();
+            return;
         }
         const gap: i32 = cfg.gap;
-        var s = gfx.Surface.create(l.conn, &l.screen, gap, 2 * gap + cfg.bar_h, width, h, 14, c.XCB_EVENT_MASK_EXPOSURE | c.XCB_EVENT_MASK_BUTTON_PRESS, cfg.bar_bg) catch return;
+        l.x = -@as(f32, width);
+        var s = gfx.Surface.create(l.conn, &l.screen, anim.round(l.x), 2 * gap + cfg.bar_h, width, h, 14, c.XCB_EVENT_MASK_EXPOSURE | c.XCB_EVENT_MASK_BUTTON_PRESS, cfg.bar_bg) catch return;
         s.map();
         s.setStack(true);
         l.surf = s;

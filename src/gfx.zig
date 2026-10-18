@@ -266,6 +266,17 @@ pub const Surface = struct {
         return s;
     }
 
+    /// Change the window height in place (no unmap, so no flicker); keeps position and rounding.
+    pub fn resize(s: *Surface, screen: *const c.xcb_screen_t, h: u16, radius: u16) void {
+        const w = s.cv.w;
+        const cv = Canvas.init(w, h) catch return;
+        s.cv.deinit();
+        s.cv = cv;
+        const v = [_]u32{ w, h };
+        _ = c.xcb_configure_window(s.conn, s.win, c.XCB_CONFIG_WINDOW_WIDTH | c.XCB_CONFIG_WINDOW_HEIGHT, &v);
+        if (radius > 0) s.applyShape(screen, radius);
+    }
+
     pub fn destroy(s: *Surface) void {
         _ = c.xcb_destroy_window(s.conn, s.win);
         _ = c.xcb_free_gc(s.conn, s.gc);

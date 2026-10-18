@@ -8,12 +8,16 @@ const store_mod = @import("store.zig");
 const dbus_mod = @import("dbus.zig");
 const sys = @import("sys.zig");
 const Launcher = @import("launcher.zig").Launcher;
+const anim = @import("anim.zig");
 
 const Tree = tree_mod.Tree;
 const Node = tree_mod.Node;
 const Rect = tree_mod.Rect;
 
 const Saved = struct { tree: Tree, focus: ?*Node = null };
+
+/// A window of the workspace we just left, sliding off screen before it is unmapped.
+const Ghost = struct { win: u32, x: f32, y: i32, w: u32, h: u32, sx: i32, target: f32 };
 
 const WM = struct {
     conn: *c.xcb_connection_t,
@@ -38,6 +42,10 @@ const WM = struct {
     wm_protocols: c.xcb_atom_t,
     wm_delete: c.xcb_atom_t,
     running: bool = true,
+    ghosts: [Tree.max_leaves]Ghost = undefined,
+    n_ghosts: usize = 0,
+    animating: bool = false,
+    last_ns: i64 = 0,
 
     fn atom(conn: *c.xcb_connection_t, name: []const u8) c.xcb_atom_t {
         const cookie = c.xcb_intern_atom(conn, 0, @intCast(name.len), name.ptr);
@@ -77,29 +85,153 @@ const WM = struct {
         }
     }
 
+    /// Compute every leaf's target rect. Nothing is sent to the server here: `stepWindows`
+    /// walks the current rects toward these.
     fn layout(wm: *WM, n: ?*Node, r: Rect) void {
         const node = n orelse return;
         if (node.isLeaf()) {
             const g: i32 = cfg.gap;
             const b2: u32 = 2 * cfg.border;
-            const vals = [_]u32{
-                @bitCast(r.x + g),
-                @bitCast(r.y + g),
-                r.w -| (2 * cfg.gap + b2),
-                r.h -| (2 * cfg.gap + b2),
-                cfg.border,
-            };
-            const mask = c.XCB_CONFIG_WINDOW_X | c.XCB_CONFIG_WINDOW_Y | c.XCB_CONFIG_WINDOW_WIDTH | c.XCB_CONFIG_WINDOW_HEIGHT | c.XCB_CONFIG_WINDOW_BORDER_WIDTH;
-            _ = c.xcb_configure_window(wm.conn, node.win, mask, &vals);
+            node.tx = r.x + g;
+            node.ty = r.y + g;
+            node.tw = @max(1, r.w -| (2 * cfg.gap + b2));
+            node.th = @max(1, r.h -| (2 * cfg.gap + b2));
             return;
         }
         wm.layout(node.a, Tree.split(node, r, false));
         wm.layout(node.b, Tree.split(node, r, true));
     }
 
+    fn configure(wm: *WM, node: *Node, with_border: bool) void {
+        node.sx = anim.round(node.cx);
+        node.sy = anim.round(node.cy);
+        node.sw = @intCast(@max(1, anim.round(node.cw)));
+        node.sh = @intCast(@max(1, anim.round(node.ch)));
+        const vals = [_]u32{ @bitCast(node.sx), @bitCast(node.sy), node.sw, node.sh, cfg.border };
+        const geom: u32 = c.XCB_CONFIG_WINDOW_X | c.XCB_CONFIG_WINDOW_Y | c.XCB_CONFIG_WINDOW_WIDTH | c.XCB_CONFIG_WINDOW_HEIGHT;
+        const border: u32 = c.XCB_CONFIG_WINDOW_BORDER_WIDTH;
+        const mask: u16 = @intCast(if (with_border) geom | border else geom);
+        _ = c.xcb_configure_window(wm.conn, node.win, mask, &vals);
+    }
+
+    /// Give every not-yet-placed leaf a starting rect (its target shifted by `off_x`, or where a
+    /// sliding-out ghost of the same window currently is) and configure it there.
+    fn place(wm: *WM, n: ?*Node, off_x: f32) void {
+        const node = n orelse return;
+        if (!node.isLeaf()) {
+            wm.place(node.a, off_x);
+            wm.place(node.b, off_x);
+            return;
+        }
+        if (node.placed) return;
+        node.cx = @floatFromInt(node.tx);
+        node.cy = @floatFromInt(node.ty);
+        node.cw = @floatFromInt(node.tw);
+        node.ch = @floatFromInt(node.th);
+        node.cx += off_x;
+        for (wm.ghosts[0..wm.n_ghosts], 0..) |gh, i| {
+            if (gh.win != node.win) continue;
+            // Switched back before the slide finished: resume from where it is.
+            node.cx = gh.x;
+            node.cy = @floatFromInt(gh.y);
+            node.cw = @floatFromInt(gh.w);
+            node.ch = @floatFromInt(gh.h);
+            node.skip_unmap -|= 1; // the pending unmap will never happen
+            wm.ghosts[i] = wm.ghosts[wm.n_ghosts - 1];
+            wm.n_ghosts -= 1;
+            break;
+        }
+        node.placed = true;
+        wm.configure(node, true);
+    }
+
     fn relayout(wm: *WM) void {
         wm.layout(wm.tree.root, wm.area);
+        wm.place(wm.tree.root, 0);
         _ = c.xcb_flush(wm.conn);
+    }
+
+    /// One animation step for the current workspace's windows. True while any is still moving.
+    fn stepWindows(wm: *WM, n: ?*Node, dt: f32) bool {
+        const node = n orelse return false;
+        if (!node.isLeaf()) {
+            const a = wm.stepWindows(node.a, dt);
+            const b = wm.stepWindows(node.b, dt);
+            return a or b;
+        }
+        if (!node.placed) return false;
+        const k = cfg.k_window;
+        const m1 = anim.settle(&node.cx, @floatFromInt(node.tx), dt, k);
+        const m2 = anim.settle(&node.cy, @floatFromInt(node.ty), dt, k);
+        const m3 = anim.settle(&node.cw, @floatFromInt(node.tw), dt, k);
+        const m4 = anim.settle(&node.ch, @floatFromInt(node.th), dt, k);
+        const nx = anim.round(node.cx);
+        const ny = anim.round(node.cy);
+        const nw: u32 = @intCast(@max(1, anim.round(node.cw)));
+        const nh: u32 = @intCast(@max(1, anim.round(node.ch)));
+        if (nx != node.sx or ny != node.sy or nw != node.sw or nh != node.sh) wm.configure(node, false);
+        return m1 or m2 or m3 or m4;
+    }
+
+    fn stepGhosts(wm: *WM, dt: f32) bool {
+        var i: usize = 0;
+        while (i < wm.n_ghosts) {
+            const g = &wm.ghosts[i];
+            const moving = anim.settle(&g.x, g.target, dt, cfg.k_workspace);
+            const nx = anim.round(g.x);
+            if (nx != g.sx) {
+                g.sx = nx;
+                const v = [_]u32{@bitCast(nx)};
+                _ = c.xcb_configure_window(wm.conn, g.win, c.XCB_CONFIG_WINDOW_X, &v);
+            }
+            if (moving) {
+                i += 1;
+            } else {
+                _ = c.xcb_unmap_window(wm.conn, g.win);
+                wm.ghosts[i] = wm.ghosts[wm.n_ghosts - 1];
+                wm.n_ghosts -= 1;
+            }
+        }
+        return wm.n_ghosts > 0;
+    }
+
+    /// Every window of the workspace we are leaving slides off in direction `-dir` and is unmapped
+    /// once it is out of sight.
+    fn ghostOut(wm: *WM, n: ?*Node, dir: f32) void {
+        const node = n orelse return;
+        if (!node.isLeaf()) {
+            wm.ghostOut(node.a, dir);
+            wm.ghostOut(node.b, dir);
+            return;
+        }
+        node.placed = false;
+        if (wm.n_ghosts >= wm.ghosts.len) {
+            node.skip_unmap += 1;
+            _ = c.xcb_unmap_window(wm.conn, node.win);
+            return;
+        }
+        node.skip_unmap += 1;
+        const w: f32 = @floatFromInt(wm.area.w);
+        wm.ghosts[wm.n_ghosts] = .{
+            .win = node.win,
+            .x = node.cx,
+            .y = anim.round(node.cy),
+            .w = @intCast(@max(1, anim.round(node.cw))),
+            .h = @intCast(@max(1, anim.round(node.ch))),
+            .sx = anim.round(node.cx),
+            .target = @as(f32, @floatFromInt(node.tx)) - dir * w,
+        };
+        wm.n_ghosts += 1;
+    }
+
+    fn animate(wm: *WM, dt: f32) bool {
+        var moving = wm.stepWindows(wm.tree.root, dt);
+        moving = wm.stepGhosts(dt) or moving;
+        moving = wm.bar.step(wm.cur, dt) or moving;
+        moving = wm.panel.step(dt) or moving;
+        moving = wm.toasts.step(dt) or moving;
+        moving = wm.launcher.step(dt) or moving;
+        return moving;
     }
 
     fn manage(wm: *WM, win: u32) void {
@@ -107,6 +239,15 @@ const WM = struct {
         const mask: u32 = c.XCB_EVENT_MASK_ENTER_WINDOW;
         _ = c.xcb_change_window_attributes(wm.conn, win, c.XCB_CW_EVENT_MASK, &mask);
         const leaf = wm.tree.insert(wm.focus, win, wm.area) catch return;
+        // Start the new window on top of the one it splits, then let both settle into their halves.
+        if (leaf.parent) |p| if (p.a) |sib| if (sib.placed and sib.isLeaf()) {
+            leaf.cx = sib.cx;
+            leaf.cy = sib.cy;
+            leaf.cw = sib.cw;
+            leaf.ch = sib.ch;
+            leaf.placed = true;
+            wm.configure(leaf, true);
+        };
         _ = c.xcb_map_window(wm.conn, win);
         wm.relayout();
         wm.setFocus(leaf);
@@ -160,14 +301,18 @@ const WM = struct {
 
     fn switchTo(wm: *WM, n: usize) void {
         if (n == wm.cur) return;
-        wm.setMapped(wm.tree.root, false);
+        const dir: f32 = if (n > wm.cur) 1 else -1;
+        wm.ghostOut(wm.tree.root, dir);
         wm.saved[wm.cur] = .{ .tree = wm.tree, .focus = wm.focus };
         wm.cur = n;
         wm.tree = wm.saved[n].tree;
         const f = wm.saved[n].focus;
         wm.focus = null;
+        // Incoming windows are configured one screen away, then mapped, then slide in.
+        wm.layout(wm.tree.root, wm.area);
+        wm.place(wm.tree.root, dir * @as(f32, @floatFromInt(wm.area.w)));
         wm.setMapped(wm.tree.root, true);
-        wm.relayout();
+        _ = c.xcb_flush(wm.conn);
         wm.setFocus(f orelse if (wm.tree.root) |r| Tree.firstLeaf(r) else null);
     }
 
@@ -245,6 +390,15 @@ const WM = struct {
         const cur = wm.focus orelse return;
         const other = wm.neighbor(dir) orelse return;
         std.mem.swap(u32, &cur.win, &other.win);
+        // The windows trade places: carry their current rects along so they glide across.
+        std.mem.swap(f32, &cur.cx, &other.cx);
+        std.mem.swap(f32, &cur.cy, &other.cy);
+        std.mem.swap(f32, &cur.cw, &other.cw);
+        std.mem.swap(f32, &cur.ch, &other.ch);
+        std.mem.swap(i32, &cur.sx, &other.sx);
+        std.mem.swap(i32, &cur.sy, &other.sy);
+        std.mem.swap(u32, &cur.sw, &other.sw);
+        std.mem.swap(u32, &cur.sh, &other.sh);
         wm.relayout();
         wm.setFocus(other); // focused window now lives in `other`
     }
@@ -276,10 +430,7 @@ const WM = struct {
                 .resize => wm.resizeDir(b.dir),
                 .workspace => wm.switchTo(b.n),
                 .send_to => wm.sendTo(b.n),
-                .toggle_panel => {
-                    wm.panel.toggle(&wm.store);
-                    wm.toasts.last_version -%= 1; // toasts shift aside when the panel opens
-                },
+                .toggle_panel => wm.panel.toggle(&wm.store),
                 .launcher => if (wm.syms) |syms| {
                     _ = wm.launcher.open(syms);
                 },
@@ -417,7 +568,7 @@ const WM = struct {
         wm.panel.draw(&wm.store, force);
     }
 
-    /// poll() budget: the clock only changes once a minute, unless a toast, the
+    /// poll() budget while idle: the clock only changes once a minute, unless a toast, the
     /// progress bar or a D-Bus timeout needs us sooner.
     fn sleepMs(wm: *WM, now: i64) c_int {
         var ts: c.struct_timespec = undefined;
@@ -442,12 +593,24 @@ const WM = struct {
             wm.dbus.process();
             const now = panel_mod.nowMs();
             wm.refreshData(now);
+
+            // Animations: dt is measured, so uneven wakeups still look even. After idling, the
+            // first frame advances by exactly one frame interval instead of the whole idle time.
+            const t0 = anim.nowNs();
+            const dt: f32 = if (wm.animating) @as(f32, @floatFromInt(t0 - wm.last_ns)) / 1e9 else 1.0 / @as(f32, @floatFromInt(cfg.anim_hz));
+            wm.last_ns = t0;
+            wm.animating = wm.animate(std.math.clamp(dt, 0.001, 0.05));
+
             wm.redrawAll(false);
             _ = c.xcb_flush(wm.conn);
             if (!wm.running) break;
             pfd[0] = .{ .fd = c.xcb_get_file_descriptor(wm.conn), .events = c.POLLIN, .revents = 0 };
             const n = 1 + wm.dbus.pollFill(pfd[1..]);
-            _ = c.poll(&pfd, @intCast(n), wm.sleepMs(now));
+            if (wm.animating) {
+                _ = anim.waitUntil(pfd[0..@intCast(n)], t0 + anim.frame_ns);
+            } else {
+                _ = c.poll(&pfd, @intCast(n), wm.sleepMs(now));
+            }
         }
     }
 };
