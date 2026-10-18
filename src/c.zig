@@ -3,6 +3,8 @@ pub const c = @cImport({
     @cInclude("xcb/xcb_keysyms.h");
     @cInclude("xcb/shape.h");
     @cInclude("systemd/sd-bus.h");
+    @cInclude("ft2build.h");
+    @cInclude("freetype/freetype.h");
     @cInclude("unistd.h");
     @cInclude("stdlib.h");
     @cInclude("dirent.h");

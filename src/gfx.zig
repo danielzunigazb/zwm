@@ -34,6 +34,39 @@ pub fn roundCoverage(x: f32, y: f32, w: f32, h: f32, r: f32) f32 {
     return std.math.clamp(r - d + 0.5, 0, 1);
 }
 
+/// Lazily loaded JetBrains Mono (regular + semibold) from the system fonts directory.
+const ttf = struct {
+    var lib: c.FT_Library = null;
+    var regular: c.FT_Face = null;
+    var semibold: c.FT_Face = null;
+    var tried = false;
+
+    const dirs = [_][]const u8{ "/usr/share/fonts/TTF/", "/usr/share/fonts/truetype/jetbrains-mono/", "/usr/share/fonts/jetbrains-mono/", "/usr/share/fonts/OTF/" };
+    const regular_names = [_][]const u8{ "JetBrainsMonoNerdFontMono-Regular.ttf", "JetBrainsMono-Regular.ttf", "JetBrainsMonoNerdFont-Regular.ttf" };
+    const semibold_names = [_][]const u8{ "JetBrainsMonoNerdFontMono-SemiBold.ttf", "JetBrainsMono-SemiBold.ttf", "JetBrainsMonoNerdFont-SemiBold.ttf" };
+
+    fn open(names: []const []const u8) c.FT_Face {
+        var buf: [256]u8 = undefined;
+        for (dirs) |d| for (names) |n| {
+            const path = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ d, n }) catch continue;
+            var face: c.FT_Face = null;
+            if (c.FT_New_Face(lib, path.ptr, 0, &face) == 0) return face;
+        };
+        return null;
+    }
+
+    fn get(bold: bool) c.FT_Face {
+        if (!tried) {
+            tried = true;
+            if (c.FT_Init_FreeType(&lib) == 0) {
+                regular = open(&regular_names);
+                semibold = open(&semibold_names);
+            }
+        }
+        return if (bold and semibold != null) semibold else regular;
+    }
+};
+
 pub const Canvas = struct {
     buf: []u32,
     w: u16,
@@ -79,8 +112,50 @@ pub const Canvas = struct {
         }
     }
 
-    pub fn textScaled(cv: *Canvas, x0: i32, y0: i32, s: []const u8, color: u32, scale: u8) i32 {
-        const sc: i32 = scale;
+    /// Text with its baseline at `base`; `px` is the em size. Advance is 0.6em (JetBrains Mono).
+    /// Falls back to the 8x16 bitmap font when no TTF could be loaded. Returns the end x.
+    pub fn textAt(cv: *Canvas, x0: i32, base: i32, s: []const u8, color: u32, px: f32, bold: bool) i32 {
+        const face = ttf.get(bold) orelse return cv.bitmapText(x0, base - 12, s, color, @max(1, @as(i32, @intFromFloat(px / 13.3 + 0.5))), bold);
+        _ = c.FT_Set_Char_Size(face, 0, @intFromFloat(px * 64), 72, 72);
+        const adv = px * 0.6;
+        var fx: f32 = @floatFromInt(x0);
+        var i: usize = 0;
+        while (i < s.len) {
+            var cp: u21 = s[i];
+            var n: usize = 1;
+            if (s[i] >= 0x80) {
+                n = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+                if (i + n > s.len) n = 1;
+                cp = if (n > 1) (std.unicode.utf8Decode(s[i..][0..n]) catch s[i]) else s[i];
+            }
+            i += n;
+            const gx: i32 = @intFromFloat(@round(fx));
+            fx += adv;
+            if (cp == ' ') continue;
+            if (c.FT_Load_Char(face, cp, c.FT_LOAD_RENDER | c.FT_LOAD_NO_HINTING) != 0) continue;
+            const g = face.*.glyph;
+            const bm = g.*.bitmap;
+            const ox = gx + g.*.bitmap_left;
+            const oy = base - g.*.bitmap_top;
+            const pitch: usize = @intCast(bm.pitch);
+            for (0..bm.rows) |r| {
+                const yy = oy + @as(i32, @intCast(r));
+                if (yy < 0 or yy >= cv.h) continue;
+                for (0..bm.width) |q| {
+                    const xx = ox + @as(i32, @intCast(q));
+                    if (xx < 0 or xx >= cv.w) continue;
+                    const a = bm.buffer[r * pitch + q];
+                    if (a == 0) continue;
+                    const idx = @as(usize, @intCast(yy)) * cv.w + @as(usize, @intCast(xx));
+                    cv.buf[idx] = blend(cv.buf[idx], color, @as(f32, @floatFromInt(a)) / 255.0);
+                }
+            }
+        }
+        return @intFromFloat(@round(fx));
+    }
+
+    fn bitmapText(cv: *Canvas, x0: i32, y0: i32, s: []const u8, color: u32, sc: i32, bold: bool) i32 {
+        if (bold) _ = cv.bitmapText(x0 + 1, y0, s, color, sc, false);
         var x = x0;
         for (s) |ch| {
             const g = font[psf_header + @as(usize, ch) * glyph_h ..][0..glyph_h];
@@ -97,14 +172,70 @@ pub const Canvas = struct {
         return x;
     }
 
-    pub fn text(cv: *Canvas, x: i32, y: i32, s: []const u8, color: u32) i32 {
-        return cv.textScaled(x, y, s, color, 1);
+    /// Legacy API: `y0` is the top of a 16px line; 8px advance per scale step.
+    pub fn textScaled(cv: *Canvas, x0: i32, y0: i32, s: []const u8, color: u32, scale: u8) i32 {
+        const k: f32 = @floatFromInt(scale);
+        return cv.textAt(x0, y0 + @as(i32, scale) * 12, s, color, 13.333 * k, false);
     }
 
-    /// Fake bold: draw twice, one pixel apart.
+    pub fn text(cv: *Canvas, x: i32, y: i32, s: []const u8, color: u32) i32 {
+        return cv.textAt(x, y + 12, s, color, 13.333, false);
+    }
+
     pub fn textBold(cv: *Canvas, x: i32, y: i32, s: []const u8, color: u32) i32 {
-        _ = cv.text(x + 1, y, s, color);
-        return cv.text(x, y, s, color);
+        return cv.textAt(x, y + 12, s, color, 13.333, true);
+    }
+
+    // ---- antialiased strokes (for icons) ----
+
+    /// Round-capped line of width `w`.
+    pub fn line(cv: *Canvas, x0: f32, y0: f32, x1: f32, y1: f32, w: f32, color: u32) void {
+        const r = w / 2;
+        const bx0: i32 = @intFromFloat(@floor(@min(x0, x1) - r - 1));
+        const bx1: i32 = @intFromFloat(@ceil(@max(x0, x1) + r + 1));
+        const by0: i32 = @intFromFloat(@floor(@min(y0, y1) - r - 1));
+        const by1: i32 = @intFromFloat(@ceil(@max(y0, y1) + r + 1));
+        const dx = x1 - x0;
+        const dy = y1 - y0;
+        const len2 = dx * dx + dy * dy;
+        var yy = @max(by0, 0);
+        while (yy <= @min(by1, cv.h - 1)) : (yy += 1) {
+            var xx = @max(bx0, 0);
+            while (xx <= @min(bx1, cv.w - 1)) : (xx += 1) {
+                const px = @as(f32, @floatFromInt(xx)) + 0.5 - x0;
+                const py = @as(f32, @floatFromInt(yy)) + 0.5 - y0;
+                const t = if (len2 == 0) 0 else std.math.clamp((px * dx + py * dy) / len2, 0, 1);
+                const ex = px - t * dx;
+                const ey = py - t * dy;
+                const cov = std.math.clamp(r - @sqrt(ex * ex + ey * ey) + 0.5, 0, 1);
+                if (cov <= 0) continue;
+                const idx = @as(usize, @intCast(yy)) * cv.w + @as(usize, @intCast(xx));
+                cv.buf[idx] = blend(cv.buf[idx], color, cov);
+            }
+        }
+    }
+
+    /// Arc around (cx, cy), angles in degrees (0 = right, 90 = down).
+    pub fn arc(cv: *Canvas, cx: f32, cy: f32, r: f32, a0: f32, a1: f32, w: f32, color: u32) void {
+        const steps: usize = 16;
+        var px: f32 = 0;
+        var py: f32 = 0;
+        for (0..steps + 1) |i| {
+            const a = (a0 + (a1 - a0) * @as(f32, @floatFromInt(i)) / steps) * std.math.pi / 180.0;
+            const x = cx + r * @cos(a);
+            const y = cy + r * @sin(a);
+            if (i > 0) cv.line(px, py, x, y, w, color);
+            px = x;
+            py = y;
+        }
+    }
+    /// Like textFit but at an explicit baseline and 13px (bold optional); cuts UTF-8 on a boundary.
+    pub fn textFit13(cv: *Canvas, x: i32, base: i32, s: []const u8, max_chars: usize, color: u32, bold: bool) i32 {
+        if (s.len <= max_chars) return cv.textAt(x, base, s, color, 13, bold);
+        var keep = if (max_chars > 3) max_chars - 3 else 0;
+        while (keep > 0 and keep < s.len and (s[keep] & 0xc0) == 0x80) keep -= 1;
+        const nx = cv.textAt(x, base, s[0..keep], color, 13, bold);
+        return cv.textAt(nx, base, "...", color, 13, bold);
     }
 
     /// Draw `s` clipped to `max_chars`, ending in "..." when cut.

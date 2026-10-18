@@ -21,6 +21,13 @@ command -v dbus-update-activation-environment >/dev/null 2>&1 &&
 # Without this X shows its default "X" cursor on the empty desktop.
 command -v xsetroot >/dev/null 2>&1 && xsetroot -cursor_name left_ptr
 
+if command -v xrdb >/dev/null 2>&1; then
+    # Bundled xterm theme first, so ~/.Xresources can override it.
+    for f in /usr/local/share/zwm/zwm.Xresources "$(dirname "$0")/zwm.Xresources"; do
+        [ -f "$f" ] && { xrdb -merge "$f"; break; }
+    done
+fi
+
 [ -f "$HOME/.Xresources" ] && command -v xrdb >/dev/null 2>&1 && xrdb -merge "$HOME/.Xresources"
 
 # Put your own startup (polkit agent, wallpaper, picom, ...) in here.

@@ -5,8 +5,8 @@ const cfg = @import("config.zig");
 const c = @import("c.zig").c;
 const gfx = @import("gfx.zig");
 const store = @import("store.zig");
+const icons = @import("icons.zig");
 
-const glyph_w = gfx.glyph_w;
 
 pub const days = [_][]const u8{ "dom", "lun", "mar", "mie", "jue", "vie", "sab" };
 pub const months = [_][]const u8{ "ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic" };
@@ -47,60 +47,57 @@ pub const Bar = struct {
         for (0..cfg.workspaces) |i| {
             const x: i32 = 6 + @as(i32, @intCast(i)) * 30;
             var digit = [1]u8{'1' + @as(u8, @intCast(i))};
+            const dx = x + 13 - 3; // 12px mono glyph is 7.2px wide, centered in the 26px pill
             if (i == cur) {
                 cv.roundRect(x, 5, 26, 22, 7, cfg.accent);
-                _ = cv.textBold(x + 9, 8, &digit, cfg.bar_bg);
+                _ = cv.textAt(dx, 20, &digit, cfg.bar_bg, 12, true);
             } else {
                 const col: u32 = if (occupied & (@as(u8, 1) << @intCast(i)) != 0) cfg.fg else cfg.fg_dim;
-                _ = cv.text(x + 9, 8, &digit, col);
+                _ = cv.textAt(dx, 20, &digit, col, 12, false);
             }
         }
 
-        // Clock + date, centered.
+        // Clock + date, centered (13px, 10px apart).
         var tbuf: [8]u8 = undefined;
         var dbuf: [16]u8 = undefined;
         const t = std.fmt.bufPrint(&tbuf, "{d:0>2}:{d:0>2}", .{ @as(u32, @intCast(tm.tm_hour)), @as(u32, @intCast(tm.tm_min)) }) catch "";
         const d = std.fmt.bufPrint(&dbuf, "{s} {d} {s}", .{ days[@intCast(tm.tm_wday)], @as(u32, @intCast(tm.tm_mday)), months[@intCast(tm.tm_mon)] }) catch "";
-        const total: i32 = @intCast((t.len + 2 + d.len) * glyph_w);
+        const total: i32 = @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(t.len + d.len)) * 7.8))) + 10;
         var cx: i32 = @divTrunc(w - total, 2);
-        cx = cv.textBold(cx, 8, t, cfg.fg_bright);
-        _ = cv.text(cx + 2 * glyph_w, 8, d, cfg.fg_dim);
+        cx = cv.textAt(cx, 20, t, cfg.fg_bright, 13, true) + 10;
+        _ = cv.textAt(cx, 20, d, cfg.fg_dim, 13, false);
 
-        // Right side, laid out right to left: battery, network, volume.
+        // Right side, laid out right to left: battery, network, volume. Icon, 6px, value; 14px between.
         var rx: i32 = w - 12;
         if (bat.pct >= 0) {
             var bbuf: [12]u8 = undefined;
             const b = std.fmt.bufPrint(&bbuf, "{d}%{s}", .{ @as(u32, @intCast(bat.pct)), if (bat.charging) "+" else "" }) catch "";
-            rx = item(cv, rx, "bat", b, cfg.fg);
+            rx = item(cv, rx, .battery, 16, b, cfg.fg);
         }
         {
-            var nbuf: [48]u8 = undefined;
             const v: []const u8 = switch (st.net) {
                 .none => "sin red",
                 .eth => "eth",
-                .wifi => if (st.net_pct >= 0)
-                    std.fmt.bufPrint(&nbuf, "{s} {d}%", .{ st.name(), @as(u32, @intCast(st.net_pct)) }) catch st.name()
-                else
-                    st.name(),
+                .wifi => st.name(),
             };
-            rx = item(cv, rx, "net", v, if (st.net == .none) cfg.fg_dim else cfg.fg);
+            rx = item(cv, rx, .wifi, 14, v, if (st.net == .none) cfg.fg_dim else cfg.fg);
         }
         if (st.vol_pct >= 0) {
             var vbuf: [12]u8 = undefined;
             const v = if (st.muted) "mute" else std.fmt.bufPrint(&vbuf, "{d}%", .{@as(u32, @intCast(st.vol_pct))}) catch "";
-            _ = item(cv, rx, "vol", v, if (st.muted) cfg.fg_dim else cfg.fg);
+            _ = item(cv, rx, .volume, 14, v, if (st.muted) cfg.fg_dim else cfg.fg);
         }
 
         bar.surf.flush();
     }
 
-    /// Draw "label value" ending at `right`; returns the x where the next item should end.
-    fn item(cv: *gfx.Canvas, right: i32, label: []const u8, value: []const u8, vcol: u32) i32 {
-        const width: i32 = @intCast((label.len + 1 + value.len) * glyph_w);
-        const x = right - width;
-        const nx = cv.text(x, 8, label, cfg.accent);
-        _ = cv.text(nx + glyph_w, 8, value, vcol);
-        return x - 18;
+    /// Draw "icon value" ending at `right`; returns the x where the next item should end.
+    fn item(cv: *gfx.Canvas, right: i32, kind: icons.Kind, isz: i32, value: []const u8, vcol: u32) i32 {
+        const vw: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(value.len)) * 7.2));
+        const x = right - vw - 6 - isz;
+        icons.draw(cv, kind, @floatFromInt(x), 9, @floatFromInt(isz), cfg.accent);
+        _ = cv.textAt(x + isz + 6, 20, value, vcol, 12, false);
+        return x - 14;
     }
 
     // ---- battery ----

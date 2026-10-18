@@ -5,6 +5,7 @@ const std = @import("std");
 const cfg = @import("config.zig");
 const c = @import("c.zig").c;
 const gfx = @import("gfx.zig");
+const icons = @import("icons.zig");
 const store = @import("store.zig");
 
 const Store = store.Store;
@@ -137,38 +138,41 @@ pub const Panel = struct {
             const offset = @mod(first_wd + 6, 7); // Monday-first
             const dim = daysIn(year, tm.tm_mon);
             const rows = @divTrunc(offset + dim + 6, 7);
-            const cell_w = 37;
+            const cell_w = 36; // 7 columns + 2px gaps fill the 236px card interior
             const cell_h = 30;
-            const card_h = pad + 16 + 10 + cell_h * (rows + 1) + pad;
+            const pitch_x = cell_w + 2;
+            const pitch_y = cell_h + 2;
+            const card_h = pad + 17 + 10 + pitch_y * (rows + 1) - 2 + pad;
             cv.roundRect(pad, y, inner_w, card_h, 10, cfg.desktop_bg);
 
             var hbuf: [32]u8 = undefined;
             const head = std.fmt.bufPrint(&hbuf, "{s} {d}", .{ full_months[@intCast(tm.tm_mon)], @as(u32, @intCast(year)) }) catch "";
-            _ = cv.textBold(pad + pad, y + pad, head, cfg.fg_bright);
+            _ = cv.textAt(pad + pad, y + pad + 13, head, cfg.fg_bright, 13, true);
             var wbuf: [12]u8 = undefined;
             const wk = std.fmt.bufPrint(&wbuf, "sem {d}", .{@as(u32, @intCast(isoWeek(year, tm.tm_yday, tm.tm_wday)))}) catch "";
-            _ = cv.text(pad + inner_w - pad - @as(i32, @intCast(wk.len * glyph_w)), y + pad, wk, cfg.fg_dim);
+            _ = cv.textAt(pad + inner_w - pad - @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(wk.len)) * 6.6))), y + pad + 13, wk, cfg.fg_dim, 11, false);
 
-            const gx = pad + pad + @divTrunc(inner_w - 2 * pad - 7 * cell_w, 2);
-            const gy = y + pad + 16 + 10;
+            const gx = pad + pad;
+            const gy = y + pad + 17 + 10;
             for ([_]u8{ 'L', 'M', 'M', 'J', 'V', 'S', 'D' }, 0..) |ch, i| {
-                _ = cv.text(gx + @as(i32, @intCast(i)) * cell_w + 14, gy + 7, &[1]u8{ch}, cfg.fg_dim);
+                _ = cv.textAt(gx + @as(i32, @intCast(i)) * pitch_x + 14, gy + 19, &[1]u8{ch}, cfg.fg_dim, 12, false);
             }
             var day: i32 = 1;
             while (day <= dim) : (day += 1) {
                 const idx = offset + day - 1;
                 const col = @mod(idx, 7);
                 const row = @divTrunc(idx, 7) + 1;
-                const cx = gx + col * cell_w;
-                const cy = gy + row * cell_h;
+                const cx = gx + col * pitch_x;
+                const cy = gy + row * pitch_y;
                 var nb: [4]u8 = undefined;
                 const num = std.fmt.bufPrint(&nb, "{d}", .{@as(u32, @intCast(day))}) catch "";
-                const tx = cx + @divTrunc(cell_w - @as(i32, @intCast(num.len * glyph_w)), 2);
+                const nw: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(num.len)) * 7.2));
+                const tx = cx + @divTrunc(cell_w - nw, 2);
                 if (day == tm.tm_mday) {
                     cv.roundRect(cx, cy, cell_w, cell_h, 8, cfg.accent);
-                    _ = cv.textBold(tx, cy + 7, num, cfg.bar_bg);
+                    _ = cv.textAt(tx, cy + 19, num, cfg.bar_bg, 12, true);
                 } else {
-                    _ = cv.text(tx, cy + 7, num, cfg.fg);
+                    _ = cv.textAt(tx, cy + 19, num, cfg.fg, 12, false);
                 }
             }
             y += card_h + card_gap;
@@ -176,13 +180,13 @@ pub const Panel = struct {
 
         // Music card.
         if (m.have) {
-            const card_h = pad + 16 + 3 + 16 + 12 + 4 + 12 + 32 + pad;
+            const card_h = pad + 17 + 3 + 16 + 12 + 4 + 12 + 22 + pad;
             cv.roundRect(pad, y, inner_w, card_h, 10, cfg.desktop_bg);
-            const maxc: usize = @intCast(@divTrunc(inner_w - 2 * pad, glyph_w));
-            _ = cv.textFit(pad + pad, y + pad, m.titleSlice(), maxc, cfg.fg_bright);
-            _ = cv.textFit(pad + pad, y + pad + 19, m.artistSlice(), maxc, cfg.fg_dim);
+            const maxc: usize = @intCast(@divTrunc(inner_w - 2 * pad, 7));
+            _ = cv.textFit13(pad + pad, y + pad + 13, m.titleSlice(), maxc, cfg.fg_bright, true);
+            _ = cv.textFit13(pad + pad, y + pad + 17 + 3 + 12, m.artistSlice(), maxc + 1, cfg.fg_dim, false);
 
-            const by = y + pad + 19 + 16 + 12;
+            const by = y + pad + 17 + 3 + 16 + 12;
             const bw = inner_w - 2 * pad;
             cv.roundRect(pad + pad, by, bw, 4, 2, 0x4c566a);
             if (m.len_us > 0) {
@@ -193,12 +197,12 @@ pub const Panel = struct {
 
             const cy = by + 4 + 12;
             const mid = @divTrunc(panel_w, 2);
-            _ = cv.textScaled(mid - 70 - 16, cy, "<<", cfg.fg, 2);
-            _ = cv.textScaled(mid - 8 * (if (m.playing) @as(i32, 2) else 1), cy, if (m.playing) "||" else ">", cfg.accent, 2);
-            _ = cv.textScaled(mid + 70 - 16, cy, ">>", cfg.fg, 2);
-            p.addHit(mid - 70 - 28, cy - 4, 56, 40, .prev);
-            p.addHit(mid - 28, cy - 4, 56, 40, .play);
-            p.addHit(mid + 70 - 28, cy - 4, 56, 40, .next);
+            icons.draw(cv, .prev, @floatFromInt(mid - 42 - 9), @floatFromInt(cy + 2), 18, cfg.fg);
+            icons.draw(cv, if (m.playing) .pause else .play, @floatFromInt(mid - 11), @floatFromInt(cy), 22, cfg.accent);
+            icons.draw(cv, .next, @floatFromInt(mid + 42 - 9), @floatFromInt(cy + 2), 18, cfg.fg);
+            p.addHit(mid - 42 - 20, cy - 4, 40, 30, .prev);
+            p.addHit(mid - 20, cy - 4, 40, 30, .play);
+            p.addHit(mid + 42 - 20, cy - 4, 40, 30, .next);
             y += card_h + card_gap;
         }
 
@@ -207,20 +211,20 @@ pub const Panel = struct {
             const card_h = @as(i32, cv.h) - y - pad;
             if (card_h > 40) {
                 cv.roundRect(pad, y, inner_w, card_h, 10, cfg.desktop_bg);
-                _ = cv.textBold(pad + pad, y + pad, "Notificaciones", cfg.fg_bright);
+                _ = cv.textAt(pad + pad, y + pad + 13, "Notificaciones", cfg.fg_bright, 13, true);
                 if (st.count > 0) {
                     var cb: [8]u8 = undefined;
                     const cnt = std.fmt.bufPrint(&cb, "{d}", .{st.count}) catch "";
-                    _ = cv.text(pad + inner_w - pad - @as(i32, @intCast(cnt.len * glyph_w)), y + pad, cnt, cfg.fg_dim);
+                    _ = cv.textAt(pad + inner_w - pad - @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(cnt.len)) * 7.2))), y + pad + 13, cnt, cfg.fg_dim, 12, false);
                 } else {
-                    _ = cv.text(pad + pad, y + pad + 26, "sin notificaciones", cfg.fg_dim);
+                    _ = cv.textAt(pad + pad, y + pad + 13 + 27, "sin notificaciones", cfg.fg_dim, 12, false);
                 }
-                const maxc: usize = @intCast(@divTrunc(inner_w - 2 * pad, glyph_w));
-                var iy = y + pad + 16 + 12;
+                const maxc: usize = @intCast(@divTrunc(inner_w - 2 * pad, 7));
+                var iy = y + pad + 17 + 10;
                 for (st.notifs[0..st.count]) |*n| {
                     if (iy + 36 > y + card_h - 6) break;
-                    _ = cv.textFit(pad + pad, iy, n.appSlice(), maxc, cfg.fg_dim);
-                    _ = cv.textFit(pad + pad, iy + 16, n.summarySlice(), maxc, cfg.fg);
+                    _ = cv.textFit13(pad + pad, iy + 12, n.appSlice(), maxc, cfg.fg_dim, false);
+                    _ = cv.textFit13(pad + pad, iy + 12 + 16, n.summarySlice(), maxc, cfg.fg, false);
                     p.addHit(pad, iy - 4, inner_w, 40, .{ .dismiss = n.id });
                     iy += 42;
                 }
@@ -238,7 +242,7 @@ pub const Widget = struct {
     last_sig: u64 = 0,
 
     pub fn init(conn: *c.xcb_connection_t, screen: *const c.xcb_screen_t) !Widget {
-        const h: u16 = 170;
+        const h: u16 = 156;
         const y: i32 = @as(i32, screen.height_in_pixels) - 56 - h;
         var w = Widget{ .surf = try gfx.Surface.create(conn, screen, 48, y, 440, h, 0, c.XCB_EVENT_MASK_EXPOSURE, cfg.desktop_bg) };
         w.surf.map();
@@ -261,15 +265,15 @@ pub const Widget = struct {
         cv.fill(cfg.desktop_bg);
         var tb: [8]u8 = undefined;
         const t = std.fmt.bufPrint(&tb, "{d:0>2}:{d:0>2}", .{ @as(u32, @intCast(tm.tm_hour)), @as(u32, @intCast(tm.tm_min)) }) catch "";
-        _ = cv.textScaled(0, 0, t, cfg.fg_bright, 6);
+        _ = cv.textAt(0, 76, t, cfg.fg_bright, 88, true);
         var db: [48]u8 = undefined;
         const d = std.fmt.bufPrint(&db, "{s} {d} de {s}", .{ full_days[@intCast(tm.tm_wday)], @as(u32, @intCast(tm.tm_mday)), full_months[@intCast(tm.tm_mon)] }) catch "";
-        _ = cv.text(2, 96 + 10, d, cfg.fg_dim);
+        _ = cv.textAt(0, 110, d, cfg.fg_dim, 16, false);
         if (m.have and m.playing) {
             var mb: [96]u8 = undefined;
-            const line = std.fmt.bufPrint(&mb, "{s} - {s}", .{ m.titleSlice(), m.artistSlice() }) catch m.titleSlice();
-            const nx = cv.text(2, 96 + 10 + 16 + 20, ">", cfg.accent);
-            _ = cv.textFit(nx + glyph_w, 96 + 10 + 16 + 20, line, 50, cfg.fg_dim);
+            const line = std.fmt.bufPrint(&mb, "{s} \xc2\xb7 {s}", .{ m.titleSlice(), m.artistSlice() }) catch m.titleSlice();
+            icons.draw(cv, .note, 0, 137, 14, cfg.accent);
+            _ = cv.textFit13(22, 150, line, 52, cfg.fg_dim, false);
         }
         w.surf.flush();
     }
@@ -315,7 +319,7 @@ pub const Toasts = struct {
             maybe.* = null;
         }
         const gap: i32 = cfg.gap;
-        const x: i32 = @as(i32, t.screen.width_in_pixels) - gap - toast_w - (if (panel_open) @as(i32, panel_w) + gap else 0);
+        const x: i32 = @as(i32, t.screen.width_in_pixels) - gap - toast_w - (if (panel_open) @as(i32, panel_w) + 2 * gap else 0);
         var y: i32 = 2 * gap + cfg.bar_h;
         for (0..n) |i| {
             const nt = for (st.notifs[0..st.count]) |*x2| {
@@ -324,7 +328,7 @@ pub const Toasts = struct {
             var lines: [2][]const u8 = undefined;
             var cut = false;
             const nl = wrap(nt.bodySlice(), 34, &lines, &cut);
-            const h: u16 = @intCast(12 + 16 + 4 + 16 + (if (nl > 0) 4 + nl * 16 else 0) + 12);
+            const h: u16 = @intCast(12 + 15 + 4 + 17 + (if (nl > 0) 4 + nl * 16 else 0) + 12);
             var s = gfx.Surface.create(t.conn, &t.screen, x, y, toast_w, h, 12, c.XCB_EVENT_MASK_EXPOSURE | c.XCB_EVENT_MASK_BUTTON_PRESS, cfg.bar_bg) catch continue;
             const cv = &s.cv;
             cv.fill(cfg.bar_bg);
@@ -332,12 +336,12 @@ pub const Toasts = struct {
                 cv.roundRect(0, 0, toast_w, h, 12, cfg.accent);
                 cv.roundRect(2, 2, toast_w - 4, h - 4, 10, cfg.bar_bg);
             }
-            _ = cv.textFit(14, 12, nt.appSlice(), 34, cfg.fg_dim);
-            _ = cv.textFit(14, 12 + 20, nt.summarySlice(), 34, cfg.fg_bright);
-            var ly: i32 = 12 + 20 + 16 + 4;
+            _ = cv.textFit13(14, 23, nt.appSlice(), 34, cfg.fg_dim, false);
+            _ = cv.textFit13(14, 44, nt.summarySlice(), 34, cfg.fg_bright, false);
+            var ly: i32 = 44 + 4 + 12;
             for (lines[0..nl], 0..) |ln, li| {
-                const nx = cv.text(14, ly, ln, cfg.fg_dim);
-                if (cut and li == nl - 1) _ = cv.text(nx, ly, "...", cfg.fg_dim);
+                const nx = cv.textAt(14, ly, ln, cfg.fg_dim, 12, false);
+                if (cut and li == nl - 1) _ = cv.textAt(nx, ly, "...", cfg.fg_dim, 12, false);
                 ly += 16;
             }
             s.map();

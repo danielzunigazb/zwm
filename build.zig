@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("xcb-keysyms", .{});
     mod.linkSystemLibrary("xcb-shape", .{});
     mod.linkSystemLibrary("libsystemd", .{}); // sd-bus
+    mod.linkSystemLibrary("freetype2", .{});
 
     const exe = b.addExecutable(.{ .name = "wm", .root_module = mod });
     b.installArtifact(exe);
