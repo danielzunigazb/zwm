@@ -6,6 +6,7 @@ pub const c = @cImport({
     @cInclude("ft2build.h");
     @cInclude("freetype/freetype.h");
     @cInclude("unistd.h");
+    @cInclude("sys/stat.h");
     @cInclude("stdlib.h");
     @cInclude("dirent.h");
     @cInclude("fcntl.h");

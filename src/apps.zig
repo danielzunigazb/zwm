@@ -28,8 +28,36 @@ pub const Db = struct {
     list: std.ArrayList(App) = .empty,
     usage: [max_usage]Usage = undefined,
     n_usage: usize = 0,
+    stamp: i64 = -1, // sum of the app dirs' mtimes when `list` was built
 
+    const system_dirs = [_][*:0]const u8{ "/usr/local/share/applications", "/usr/share/applications", "/var/lib/flatpak/exports/share/applications" };
+
+    fn dirStamp() i64 {
+        var sum: i64 = 0;
+        var buf: [512]u8 = undefined;
+        if (c.getenv("HOME")) |home| {
+            if (std.fmt.bufPrintZ(&buf, "{s}/.local/share/applications", .{std.mem.span(home)})) |p| sum += mtime(p) else |_| {}
+        }
+        for (system_dirs) |d| sum += mtime(d);
+        return sum;
+    }
+
+    fn mtime(path: [*:0]const u8) i64 {
+        var st: c.struct_stat = undefined;
+        if (c.stat(path, &st) != 0) return 0;
+        return @as(i64, st.st_mtim.tv_sec) * 7 + @as(i64, st.st_mtim.tv_nsec);
+    }
+
+    /// Rescan only when an applications directory changed since the last scan (opening the
+    /// launcher must not read hundreds of files each time); usage counts are always refreshed.
     pub fn load(db: *Db) void {
+        const now = dirStamp();
+        if (db.stamp == now and db.list.items.len > 0) {
+            db.loadUsage();
+            return;
+        }
+        db.list.clearRetainingCapacity();
+        db.stamp = now;
         const gpa = std.heap.c_allocator;
         // User dir first so its entries win over system duplicates.
         if (c.getenv("HOME")) |home| {
@@ -38,9 +66,7 @@ pub const Db = struct {
                 db.scanDir(gpa, p);
             } else |_| {}
         }
-        inline for (.{ "/usr/local/share/applications", "/usr/share/applications", "/var/lib/flatpak/exports/share/applications" }) |dir| {
-            db.scanDir(gpa, dir);
-        }
+        for (system_dirs) |dir| db.scanDir(gpa, dir);
         db.loadUsage();
     }
 
@@ -240,4 +266,28 @@ fn cleanExec(dst: []u8, src: []const u8) u8 {
         n += 1;
     }
     return @intCast(std.mem.trimEnd(u8, dst[0..n], " ").len);
+}
+
+test "fuzzy matching" {
+    try std.testing.expect(fuzzy("Firefox", "ff") > 0);
+    try std.testing.expect(fuzzy("Firefox", "fx") > 0);
+    try std.testing.expect(fuzzy("Firefox", "xz") < 0);
+    // A prefix beats a scattered subsequence.
+    try std.testing.expect(fuzzy("Files", "fi") > fuzzy("Software Updater", "fi"));
+    try std.testing.expect(fuzzy("a", "abc") < 0);
+}
+
+test "desktop file parsing" {
+    const ok = parseDesktop("[Desktop Entry]\nType=Application\nName=Foo\nName[es]=Fu\nExec=foo --bar %U\nTerminal=true\n[Desktop Action x]\nExec=other\n").?;
+    try std.testing.expectEqualStrings("Foo", ok.nameS());
+    try std.testing.expectEqualStrings("foo --bar", ok.execS());
+    try std.testing.expect(ok.terminal);
+    try std.testing.expect(parseDesktop("[Desktop Entry]\nName=H\nExec=h\nNoDisplay=true\n") == null);
+    try std.testing.expect(parseDesktop("[Desktop Entry]\nType=Link\nName=L\nExec=l\n") == null);
+    try std.testing.expect(parseDesktop("garbage") == null);
+}
+
+test "exec field codes" {
+    var b: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("sh -c 'echo 100%'", b[0..cleanExec(&b, "sh -c 'echo 100%%' %F")]);
 }

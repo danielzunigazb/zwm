@@ -63,7 +63,6 @@ pub const Launcher = struct {
             s.destroy();
             l.surf = null;
             _ = c.xcb_ungrab_keyboard(l.conn, c.XCB_CURRENT_TIME);
-            l.db.deinit();
             _ = c.xcb_flush(l.conn);
         }
     }

@@ -313,6 +313,22 @@ const toast_w: u16 = 300;
 
 const Toast = struct { surf: gfx.Surface, id: u32, hash: u64, h: i32, x: f32, y: f32, tx: f32, ty: f32, leaving: bool };
 
+fn paintToast(cv: *gfx.Canvas, nt: *const store.Notif, lines: []const []const u8, cut: bool, h: i32, first: bool) void {
+    cv.fill(cfg.bar_bg);
+    if (first) {
+        cv.roundRect(0, 0, toast_w, @intCast(h), 12, cfg.accent);
+        cv.roundRect(2, 2, toast_w - 4, @intCast(h - 4), 10, cfg.bar_bg);
+    }
+    _ = cv.textFit13(14, 23, nt.appSlice(), 34, cfg.fg_dim, false);
+    _ = cv.textFit13(14, 44, nt.summarySlice(), 34, cfg.fg_bright, false);
+    var ly: i32 = 44 + 4 + 12;
+    for (lines, 0..) |ln, li| {
+        const nx = cv.textAt(14, ly, ln, cfg.fg_dim, 12, false);
+        if (cut and li == lines.len - 1) _ = cv.textAt(nx, ly, "...", cfg.fg_dim, 12, false);
+        ly += 16;
+    }
+}
+
 pub const Toasts = struct {
     conn: *c.xcb_connection_t,
     screen: c.xcb_screen_t,
@@ -364,6 +380,8 @@ pub const Toasts = struct {
             hh.update(nt.summarySlice());
             hh.update("\x00");
             hh.update(nt.bodySlice());
+            const first = id == want[0];
+            hh.update(&[_]u8{@intFromBool(first)});
             const hash = hh.final();
 
             var slot: ?*?Toast = null;
@@ -384,7 +402,17 @@ pub const Toasts = struct {
                     y += old.h + gap;
                     continue;
                 }
-                // Text changed (a replaced notification): rebuild in place, no new slide.
+                if (old.h == h) {
+                    // Same size: repaint the existing window (e.g. it stopped being the newest).
+                    paintToast(&sl.*.?.surf.cv, nt, lines[0..nl], cut, h, first);
+                    sl.*.?.surf.flush();
+                    sl.*.?.hash = hash;
+                    sl.*.?.tx = rest_x;
+                    sl.*.?.ty = @floatFromInt(y);
+                    y += h + gap;
+                    continue;
+                }
+                // Size changed: rebuild the window where it is, without a new slide.
                 start_x = old.x;
                 start_y = old.y;
                 var o = old;
@@ -395,20 +423,7 @@ pub const Toasts = struct {
             const dst = free orelse continue;
 
             var s = gfx.Surface.create(t.conn, &t.screen, anim.round(start_x), anim.round(start_y), toast_w, @intCast(h), 12, c.XCB_EVENT_MASK_EXPOSURE | c.XCB_EVENT_MASK_BUTTON_PRESS, cfg.bar_bg) catch continue;
-            const cv = &s.cv;
-            cv.fill(cfg.bar_bg);
-            if (id == want[0]) {
-                cv.roundRect(0, 0, toast_w, @intCast(h), 12, cfg.accent);
-                cv.roundRect(2, 2, toast_w - 4, @intCast(h - 4), 10, cfg.bar_bg);
-            }
-            _ = cv.textFit13(14, 23, nt.appSlice(), 34, cfg.fg_dim, false);
-            _ = cv.textFit13(14, 44, nt.summarySlice(), 34, cfg.fg_bright, false);
-            var ly: i32 = 44 + 4 + 12;
-            for (lines[0..nl], 0..) |ln, li| {
-                const nx = cv.textAt(14, ly, ln, cfg.fg_dim, 12, false);
-                if (cut and li == nl - 1) _ = cv.textAt(nx, ly, "...", cfg.fg_dim, 12, false);
-                ly += 16;
-            }
+            paintToast(&s.cv, nt, lines[0..nl], cut, h, first);
             s.map();
             s.setStack(true);
             dst.* = .{ .surf = s, .id = id, .hash = hash, .h = h, .x = start_x, .y = start_y, .tx = rest_x, .ty = @floatFromInt(y), .leaving = false };
@@ -463,19 +478,19 @@ pub const Toasts = struct {
     }
 };
 
-/// Greedy word wrap into at most 2 lines of `width` chars (slices of `s`). Returns line count.
+/// Greedy word wrap into at most 2 lines of `width` code points (slices of `s`). Returns line count.
 fn wrap(s: []const u8, width: usize, out: *[2][]const u8, truncated: *bool) usize {
     var rest = std.mem.trim(u8, s, " ");
     var n: usize = 0;
     while (rest.len > 0 and n < 2) {
-        if (rest.len <= width) {
+        if (gfx.cpCount(rest) <= width) {
             out[n] = rest;
             n += 1;
             rest = rest[0..0];
             break;
         }
-        var cut: usize = width;
-        if (std.mem.lastIndexOfScalar(u8, rest[0 .. width + 1], ' ')) |sp| {
+        var cut: usize = gfx.cpOffset(rest, width);
+        if (std.mem.lastIndexOfScalar(u8, rest[0..@min(rest.len, cut + 1)], ' ')) |sp| {
             if (sp > 0) cut = sp;
         }
         out[n] = rest[0..cut];
@@ -484,4 +499,16 @@ fn wrap(s: []const u8, width: usize, out: *[2][]const u8, truncated: *bool) usiz
     }
     truncated.* = rest.len > 0;
     return n;
+}
+
+test "toast wrapping" {
+    var lines: [2][]const u8 = undefined;
+    var cut = false;
+    try std.testing.expectEqual(@as(usize, 1), wrap("short", 34, &lines, &cut));
+    try std.testing.expect(!cut);
+    try std.testing.expectEqual(@as(usize, 2), wrap("aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk", 20, &lines, &cut));
+    try std.testing.expect(lines[0].len <= 20 and lines[1].len <= 20);
+    try std.testing.expectEqual(@as(usize, 0), wrap("   ", 20, &lines, &cut));
+    _ = wrap("\xc3\xb1" ** 100, 10, &lines, &cut); // multibyte must not split a code point
+    try std.testing.expect(std.unicode.utf8ValidateSlice(lines[0]));
 }

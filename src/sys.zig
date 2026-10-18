@@ -9,8 +9,11 @@ const bar = @import("bar.zig");
 pub fn runWait(cmd: [*:0]const u8) void {
     const pid = c.fork();
     if (pid == 0) {
-        const argv = [_:null]?[*:0]const u8{ "sh", "-c", cmd };
-        _ = c.execvp("sh", @ptrCast(&argv));
+        // `timeout` so a wedged audio server can never freeze the WM's event loop.
+        const argv = [_:null]?[*:0]const u8{ "timeout", "2", "sh", "-c", cmd };
+        _ = c.execvp("timeout", @ptrCast(&argv));
+        const plain = [_:null]?[*:0]const u8{ "sh", "-c", cmd };
+        _ = c.execvp("sh", @ptrCast(&plain));
         c._exit(127);
     } else if (pid > 0) {
         _ = c.waitpid(pid, null, 0);
@@ -34,7 +37,7 @@ pub fn spawn(cmd: [*:0]const u8) void {
 
 /// Query the default sink with wpctl. Leaves `st` untouched if wpctl is unavailable.
 pub fn readVolume(st: *store.Status) void {
-    const f = c.popen("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r") orelse return;
+    const f = c.popen("timeout 1 wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r") orelse return;
     var buf: [64]u8 = undefined;
     const got = c.fgets(&buf, buf.len, f);
     _ = c.pclose(f);

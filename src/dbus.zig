@@ -22,11 +22,13 @@ pub const Dbus = struct {
     /// `d` must not move afterwards (callbacks keep a pointer to it).
     pub fn connect(d: *Dbus, st: *Store) void {
         d.store = st;
+        st.music_dirty = true;
+        st.net_dirty = true;
 
         var bus: ?*c.sd_bus = null;
         if (c.sd_bus_open_user(&bus) >= 0 and bus != null) {
             d.session = bus;
-            _ = c.sd_bus_set_method_call_timeout(bus, 300_000); // µs: never stall the WM
+            _ = c.sd_bus_set_method_call_timeout(bus, 150_000); // µs: never stall the WM
             // Fails harmlessly if another notification daemon already owns the name.
             _ = c.sd_bus_request_name(bus, "org.freedesktop.Notifications", 0);
             _ = c.sd_bus_add_filter(bus, null, onMethod, d);
@@ -37,7 +39,7 @@ pub const Dbus = struct {
         var sbus: ?*c.sd_bus = null;
         if (c.sd_bus_open_system(&sbus) >= 0 and sbus != null) {
             d.system = sbus;
-            _ = c.sd_bus_set_method_call_timeout(sbus, 300_000);
+            _ = c.sd_bus_set_method_call_timeout(sbus, 150_000);
             _ = c.sd_bus_add_match(sbus, null, "type='signal',sender='org.freedesktop.NetworkManager',interface='org.freedesktop.NetworkManager',member='StateChanged'", onNetSignal, d);
         }
     }
@@ -71,9 +73,17 @@ pub const Dbus = struct {
     }
 
     pub fn process(d: *Dbus) void {
-        for ([_]?*c.sd_bus{ d.session, d.system }) |maybe| {
-            const bus = maybe orelse continue;
-            while (c.sd_bus_process(bus, null) > 0) {}
+        for ([_]*?*c.sd_bus{ &d.session, &d.system }) |slot| {
+            const bus = slot.* orelse continue;
+            var r: c_int = 1;
+            while (r > 0) r = c.sd_bus_process(bus, null);
+            if (r < 0 or c.sd_bus_is_open(bus) <= 0) {
+                // The daemon went away: drop the bus, otherwise its dead fd makes poll() spin.
+                _ = c.sd_bus_flush_close_unref(bus);
+                slot.* = null;
+                if (slot == &d.session) d.player_len = 0;
+                continue;
+            }
             _ = c.sd_bus_flush(bus);
         }
     }

@@ -38,9 +38,11 @@ const WM = struct {
     // `tree`/`focus` are the live workspace; the others sit here (saved[cur] is stale).
     saved: [cfg.workspaces]Saved,
     cur: usize = 0,
-    keycodes: [cfg.binds.len]c.xcb_keycode_t = undefined,
+    keycodes: [cfg.binds.len]c.xcb_keycode_t = [_]c.xcb_keycode_t{0} ** cfg.binds.len, // 0 = no such key on this keyboard
     wm_protocols: c.xcb_atom_t,
     wm_delete: c.xcb_atom_t,
+    wm_type: c.xcb_atom_t, // _NET_WM_WINDOW_TYPE
+    float_types: [8]c.xcb_atom_t, // types that float instead of tiling
     running: bool = true,
     ghosts: [Tree.max_leaves]Ghost = undefined,
     n_ghosts: usize = 0,
@@ -62,6 +64,7 @@ const WM = struct {
         for (cfg.binds, 0..) |b, i| {
             const kc = c.xcb_key_symbols_get_keycode(syms, b.keysym) orelse continue;
             defer std.c.free(kc);
+            if (kc[0] == 0) continue; // NoSymbol
             wm.keycodes[i] = kc[0];
             const m = (if (b.mod) cfg.mod_mask else 0) | b.extra;
             for (extra) |e| {
@@ -238,8 +241,50 @@ const WM = struct {
         return moving;
     }
 
+    /// Dialogs, splash screens, menus, docks...: shown where they ask to be, never tiled.
+    fn shouldFloat(wm: *WM, win: u32) bool {
+        const tf = c.xcb_get_property(wm.conn, 0, win, c.XCB_ATOM_WM_TRANSIENT_FOR, c.XCB_ATOM_WINDOW, 0, 1);
+        if (c.xcb_get_property_reply(wm.conn, tf, null)) |r| {
+            defer std.c.free(r);
+            if (r.*.value_len > 0) return true;
+        }
+        const ck = c.xcb_get_property(wm.conn, 0, win, wm.wm_type, c.XCB_ATOM_ATOM, 0, 8);
+        const r = c.xcb_get_property_reply(wm.conn, ck, null) orelse return false;
+        defer std.c.free(r);
+        const n: usize = @intCast(@max(0, @divTrunc(c.xcb_get_property_value_length(r), 4)));
+        const atoms: [*]const u32 = @ptrCast(@alignCast(c.xcb_get_property_value(r)));
+        for (atoms[0..n]) |a| for (wm.float_types) |ft| if (ft != 0 and a == ft) return true;
+        return false;
+    }
+
+    fn mapFloating(wm: *WM, win: u32) void {
+        const mask: u32 = c.XCB_EVENT_MASK_ENTER_WINDOW;
+        _ = c.xcb_change_window_attributes(wm.conn, win, c.XCB_CW_EVENT_MASK, &mask);
+        if (c.xcb_get_geometry_reply(wm.conn, c.xcb_get_geometry(wm.conn, win), null)) |g| {
+            defer std.c.free(g);
+            // Windows that did not pick a position get centered in the usable area.
+            if (g.*.x <= 0 and g.*.y <= 0) {
+                const x: i32 = wm.area.x + @divTrunc(@as(i32, @intCast(wm.area.w)) - g.*.width, 2);
+                const y: i32 = wm.area.y + @divTrunc(@as(i32, @intCast(wm.area.h)) - g.*.height, 2);
+                const v = [_]u32{ @bitCast(@max(x, wm.area.x)), @bitCast(@max(y, wm.area.y)) };
+                _ = c.xcb_configure_window(wm.conn, win, c.XCB_CONFIG_WINDOW_X | c.XCB_CONFIG_WINDOW_Y, &v);
+            }
+        }
+        _ = c.xcb_map_window(wm.conn, win);
+        const top = [_]u32{c.XCB_STACK_MODE_ABOVE};
+        _ = c.xcb_configure_window(wm.conn, win, c.XCB_CONFIG_WINDOW_STACK_MODE, &top);
+        _ = c.xcb_set_input_focus(wm.conn, c.XCB_INPUT_FOCUS_POINTER_ROOT, win, c.XCB_CURRENT_TIME);
+        _ = c.xcb_flush(wm.conn);
+    }
+
     fn manage(wm: *WM, win: u32) void {
         if (wm.tree.find(win) != null) return;
+        // A window of another workspace asking to map: leave it hidden, never duplicate it here.
+        if (wm.findHidden(win) != null) return;
+        if (wm.shouldFloat(win)) {
+            wm.mapFloating(win);
+            return;
+        }
         const mask: u32 = c.XCB_EVENT_MASK_ENTER_WINDOW;
         _ = c.xcb_change_window_attributes(wm.conn, win, c.XCB_CW_EVENT_MASK, &mask);
         const leaf = wm.tree.insert(wm.focus, win, wm.area) catch return;
@@ -257,7 +302,16 @@ const WM = struct {
         wm.setFocus(leaf);
     }
 
+    fn dropGhost(wm: *WM, win: u32) void {
+        for (wm.ghosts[0..wm.n_ghosts], 0..) |g, i| if (g.win == win) {
+            wm.ghosts[i] = wm.ghosts[wm.n_ghosts - 1];
+            wm.n_ghosts -= 1;
+            return;
+        };
+    }
+
     fn unmanage(wm: *WM, win: u32) void {
+        wm.dropGhost(win);
         if (wm.tree.find(win)) |leaf| {
             if (wm.focus == leaf) wm.focus = null;
             const next = wm.tree.remove(leaf);
@@ -335,8 +389,24 @@ const WM = struct {
         wm.setFocus(next);
     }
 
+    fn supportsDelete(wm: *WM, win: u32) bool {
+        const ck = c.xcb_get_property(wm.conn, 0, win, wm.wm_protocols, c.XCB_ATOM_ATOM, 0, 32);
+        const r = c.xcb_get_property_reply(wm.conn, ck, null) orelse return false;
+        defer std.c.free(r);
+        const n: usize = @intCast(@max(0, @divTrunc(c.xcb_get_property_value_length(r), 4)));
+        const atoms: [*]const u32 = @ptrCast(@alignCast(c.xcb_get_property_value(r)));
+        for (atoms[0..n]) |a| if (a == wm.wm_delete) return true;
+        return false;
+    }
+
+    /// Ask nicely (WM_DELETE_WINDOW); clients that do not speak it are killed instead.
     fn closeFocused(wm: *WM) void {
         const leaf = wm.focus orelse return;
+        if (!wm.supportsDelete(leaf.win)) {
+            _ = c.xcb_kill_client(wm.conn, leaf.win);
+            _ = c.xcb_flush(wm.conn);
+            return;
+        }
         var ev = std.mem.zeroes(c.xcb_client_message_event_t);
         ev.response_type = c.XCB_CLIENT_MESSAGE;
         ev.format = 32;
@@ -416,6 +486,20 @@ const WM = struct {
         wm.relayout();
     }
 
+    /// Take over windows that are already on screen (after a WM restart) instead of orphaning them.
+    fn adopt(wm: *WM) void {
+        const r = c.xcb_query_tree_reply(wm.conn, c.xcb_query_tree(wm.conn, wm.root), null) orelse return;
+        defer std.c.free(r);
+        const n: usize = @intCast(@max(0, c.xcb_query_tree_children_length(r)));
+        const kids = c.xcb_query_tree_children(r)[0..n];
+        for (kids) |w| {
+            const a = c.xcb_get_window_attributes_reply(wm.conn, c.xcb_get_window_attributes(wm.conn, w), null) orelse continue;
+            defer std.c.free(a);
+            if (a.*.override_redirect != 0 or a.*.map_state != c.XCB_MAP_STATE_VIEWABLE) continue;
+            wm.manage(w);
+        }
+    }
+
     fn onKey(wm: *WM, ev: *c.xcb_key_press_event_t) void {
         if (wm.launcher.visible()) { // keyboard is grabbed: everything goes to the launcher
             wm.launcherResult(wm.launcher.onKey(ev));
@@ -424,7 +508,7 @@ const WM = struct {
         const state = ev.state & ~@as(u16, 2 | 16); // drop lock bits
         for (cfg.binds, 0..) |b, i| {
             const m = (if (b.mod) cfg.mod_mask else 0) | b.extra;
-            if (ev.detail != wm.keycodes[i] or state != m) continue;
+            if (wm.keycodes[i] == 0 or ev.detail != wm.keycodes[i] or state != m) continue;
             switch (b.action) {
                 .spawn_terminal => sys.spawn(cfg.terminal),
                 .close => wm.closeFocused(),
@@ -487,7 +571,11 @@ const WM = struct {
                 wm.launcher.raise();
             },
             c.XCB_UNMAP_NOTIFY => wm.onUnmap(@as(*c.xcb_unmap_notify_event_t, @ptrCast(@alignCast(ev))).window),
-            c.XCB_DESTROY_NOTIFY => wm.unmanage(@as(*c.xcb_destroy_notify_event_t, @ptrCast(@alignCast(ev))).window),
+            c.XCB_DESTROY_NOTIFY => {
+                wm.unmanage(@as(*c.xcb_destroy_notify_event_t, @ptrCast(@alignCast(ev))).window);
+                // A floating window may have held the input focus.
+                if (wm.focus) |f| if (f.isLeaf()) wm.setFocus(f);
+            },
             c.XCB_CONFIGURE_REQUEST => wm.onConfigureRequest(@ptrCast(@alignCast(ev))),
             c.XCB_KEY_PRESS => wm.onKey(@ptrCast(@alignCast(ev))),
             c.XCB_EXPOSE => {
@@ -502,6 +590,8 @@ const WM = struct {
             c.XCB_BUTTON_PRESS => wm.onClick(@ptrCast(@alignCast(ev))),
             c.XCB_ENTER_NOTIFY => {
                 const e: *c.xcb_enter_notify_event_t = @ptrCast(@alignCast(ev));
+                // Windows gliding under a still pointer must not steal focus, nor must grab crossings.
+                if (wm.animating or e.mode != c.XCB_NOTIFY_MODE_NORMAL or e.detail == c.XCB_NOTIFY_DETAIL_INFERIOR) return;
                 if (wm.tree.find(e.event)) |leaf| if (leaf != wm.focus) wm.setFocus(leaf);
             },
             else => {},
@@ -654,10 +744,31 @@ pub fn main() !void {
         .saved = [_]Saved{.{ .tree = .{ .gpa = std.heap.c_allocator } }} ** cfg.workspaces,
         .wm_protocols = WM.atom(conn, "WM_PROTOCOLS"),
         .wm_delete = WM.atom(conn, "WM_DELETE_WINDOW"),
+        .wm_type = WM.atom(conn, "_NET_WM_WINDOW_TYPE"),
+        .float_types = .{
+            WM.atom(conn, "_NET_WM_WINDOW_TYPE_DIALOG"),
+            WM.atom(conn, "_NET_WM_WINDOW_TYPE_SPLASH"),
+            WM.atom(conn, "_NET_WM_WINDOW_TYPE_UTILITY"),
+            WM.atom(conn, "_NET_WM_WINDOW_TYPE_DOCK"),
+            WM.atom(conn, "_NET_WM_WINDOW_TYPE_MENU"),
+            WM.atom(conn, "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU"),
+            WM.atom(conn, "_NET_WM_WINDOW_TYPE_POPUP_MENU"),
+            WM.atom(conn, "_NET_WM_WINDOW_TYPE_TOOLTIP"),
+        },
     };
     wm.grabKeys();
     wm.dbus.connect(&wm.store);
+    wm.launcher.db.load(); // warm the app list so the first Alt+Space does not stall
+    wm.adopt();
     sys.readVolume(&wm.store.status);
     _ = c.xcb_flush(conn);
     wm.run();
+}
+
+test {
+    _ = @import("calc.zig");
+    _ = @import("store.zig");
+    _ = @import("apps.zig");
+    _ = @import("panel.zig");
+    _ = @import("tree.zig");
 }

@@ -118,3 +118,28 @@ pub fn format(buf: []u8, v: f64) []const u8 {
     const r = @round(v * 1e9) / 1e9;
     return std.fmt.bufPrint(buf, "{d}", .{r}) catch "?";
 }
+
+test "arithmetic" {
+    try std.testing.expectEqual(@as(?f64, 7), eval("1+2*3"));
+    try std.testing.expectEqual(@as(?f64, 9), eval("(1+2)*3"));
+    try std.testing.expectEqual(@as(?f64, 512), eval("2^3^2"));
+    try std.testing.expectEqual(@as(?f64, 42), eval("6x7"));
+    try std.testing.expectEqual(@as(?f64, -1), eval("2-3"));
+    try std.testing.expectEqual(@as(?f64, 1), eval("10%3"));
+}
+
+test "rejects what is not a calculation" {
+    try std.testing.expectEqual(@as(?f64, null), eval("firefox"));
+    try std.testing.expectEqual(@as(?f64, null), eval("42")); // bare number stays an app search
+    try std.testing.expectEqual(@as(?f64, null), eval("1/0"));
+    try std.testing.expectEqual(@as(?f64, null), eval("(1+2"));
+    try std.testing.expectEqual(@as(?f64, null), eval("1++"));
+    try std.testing.expectEqual(@as(?f64, null), eval("x2"));
+    try std.testing.expectEqual(@as(?f64, null), eval("9^9^9^9"));
+}
+
+test "format hides float noise" {
+    var b: [48]u8 = undefined;
+    try std.testing.expectEqualStrings("0.3", format(&b, 0.1 + 0.2));
+    try std.testing.expectEqualStrings("42", format(&b, 42));
+}

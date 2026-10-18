@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -18,6 +18,10 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{ .name = "wm", .root_module = mod });
     b.installArtifact(exe);
+
+    // `zig build test` runs the pure-logic unit tests (calculator, sanitizer, fuzzy search, ...).
+    const tests = b.addTest(.{ .root_module = mod });
+    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());

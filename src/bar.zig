@@ -103,7 +103,7 @@ pub const Bar = struct {
 
     /// Draw "icon value" ending at `right`; returns the x where the next item should end.
     fn item(cv: *gfx.Canvas, right: i32, kind: icons.Kind, isz: i32, value: []const u8, vcol: u32) i32 {
-        const vw: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(value.len)) * 7.2));
+        const vw: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(gfx.cpCount(value))) * 7.2));
         const x = right - vw - 6 - isz;
         icons.draw(cv, kind, @floatFromInt(x), 9, @floatFromInt(isz), cfg.accent);
         _ = cv.textAt(x + isz + 6, 20, value, vcol, 12, false);
@@ -116,7 +116,7 @@ pub const Bar = struct {
 
     fn battery(bar: *Bar) Battery {
         const base = bar.bat_path orelse return .{};
-        var path: [64]u8 = undefined;
+        var path: [160]u8 = undefined;
         var buf: [16]u8 = undefined;
         const cap = readFile(std.fmt.bufPrintZ(&path, "{s}/capacity", .{std.mem.span(base)}) catch return .{}, &buf);
         const pct = std.fmt.parseInt(i32, std.mem.trim(u8, cap, " \n"), 10) catch return .{};
@@ -125,13 +125,22 @@ pub const Bar = struct {
     }
 };
 
+var bat_dir: [96:0]u8 = undefined;
+
+/// First power supply of type Battery (BAT0, BAT1, BATT, CMB0, ...).
 fn findBattery() ?[*:0]const u8 {
-    const candidates = [_][*:0]const u8{ "/sys/class/power_supply/BAT0", "/sys/class/power_supply/BAT1" };
-    var buf: [16]u8 = undefined;
-    for (candidates) |p| {
-        var path: [64]u8 = undefined;
-        const f = std.fmt.bufPrintZ(&path, "{s}/capacity", .{std.mem.span(p)}) catch continue;
-        if (readFile(f, &buf).len > 0) return p;
+    const root = "/sys/class/power_supply";
+    const dir = c.opendir(root) orelse return null;
+    defer _ = c.closedir(dir);
+    var buf: [32]u8 = undefined;
+    while (c.readdir(dir)) |ent| {
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.*.d_name)), 0);
+        if (name.len == 0 or name[0] == '.') continue;
+        var tp: [160]u8 = undefined;
+        const tpath = std.fmt.bufPrintZ(&tp, "{s}/{s}/type", .{ root, name }) catch continue;
+        if (!std.mem.startsWith(u8, readFile(tpath, &buf), "Battery")) continue;
+        const dst = std.fmt.bufPrintZ(&bat_dir, "{s}/{s}", .{ root, name }) catch continue;
+        return dst.ptr;
     }
     return null;
 }

@@ -2,6 +2,7 @@
 // and the widgets that draw it.
 
 const std = @import("std");
+const gfx = @import("gfx.zig");
 
 pub const Net = enum { none, wifi, eth };
 
@@ -62,16 +63,31 @@ pub const Notif = struct {
 
 const latin1_map = "AAAAAAACEEEEIIIIDNOOOOO*OUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";
 
-/// Copy UTF-8 into `dst` as printable ASCII (the bitmap font has no accents). Returns length.
+/// Copy text into `dst`, replacing control characters. With the TTF font loaded the UTF-8 is kept
+/// (cut on a code point boundary); with only the bitmap font it is folded to printable ASCII.
 pub fn sanitize(dst: []u8, src: []const u8) u8 {
+    const cap = @min(dst.len, 255);
     var n: usize = 0;
     var i: usize = 0;
-    while (i < src.len and n < dst.len) {
+    const utf8 = gfx.hasTtf();
+    while (i < src.len and n < cap) {
         const b = src[i];
         if (b < 0x80) {
-            dst[n] = if (b < 0x20) ' ' else b;
+            dst[n] = if (b < 0x20 or b == 0x7f) ' ' else b;
             n += 1;
             i += 1;
+        } else if (utf8) {
+            const l = std.unicode.utf8ByteSequenceLength(b) catch 0;
+            const ok = l > 1 and i + l <= src.len and (std.unicode.utf8Decode(src[i..][0..l]) catch null) != null;
+            if (!ok) {
+                dst[n] = '?';
+                n += 1;
+                i += 1;
+            } else if (n + l <= cap) {
+                @memcpy(dst[n..][0..l], src[i..][0..l]);
+                n += l;
+                i += l;
+            } else break;
         } else if (b == 0xC3 and i + 1 < src.len and src[i + 1] >= 0x80 and src[i + 1] <= 0xBF) {
             dst[n] = latin1_map[src[i + 1] - 0x80];
             n += 1;
@@ -120,7 +136,7 @@ pub const Store = struct {
             n.id = s.next_id;
             s.next_id +%= 1;
             if (s.next_id == 0) s.next_id = 1;
-            const keep = @min(s.count, max_notifs - 1);
+            const keep: usize = @min(s.count, max_notifs - 1);
             @memmove(s.notifs[1 .. keep + 1], s.notifs[0..keep]);
             s.count = keep + 1;
         }
@@ -155,3 +171,28 @@ pub const Store = struct {
         s.notif_version +%= 1;
     }
 };
+
+test "sanitize never overruns and keeps valid text" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(u8, 3), sanitize(&buf, "abc"));
+    try std.testing.expectEqual(@as(u8, 8), sanitize(&buf, "0123456789")); // cut at capacity
+    try std.testing.expectEqualStrings("a b", buf[0..sanitize(&buf, "a\nb")]); // control -> space
+    _ = sanitize(&buf, "\xff\xfe\xc3"); // invalid / truncated sequences must not crash
+    _ = sanitize(&buf, "\xe2\x82"); // truncated 3-byte sequence
+}
+
+test "notification store: replace, dismiss, overflow" {
+    var s = Store{};
+    const a = s.add("app", "one", "", 0, 0, 0);
+    const b = s.add("app", "two", "", 0, 0, 0);
+    try std.testing.expect(a != b and s.count == 2);
+    const a2 = s.add("app", "one again", "", a, 0, 0);
+    try std.testing.expectEqual(a, a2); // replaced keeps its id...
+    try std.testing.expectEqual(@as(usize, 2), s.count);
+    try std.testing.expectEqual(a, s.notifs[0].id); // ...and moves to the front
+    s.dismiss(b);
+    try std.testing.expectEqual(@as(usize, 1), s.count);
+    s.dismiss(9999); // unknown id: no-op
+    for (0..40) |_| _ = s.add("app", "x", "", 0, 0, 0);
+    try std.testing.expectEqual(@as(usize, max_notifs), s.count);
+}

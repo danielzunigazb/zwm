@@ -127,6 +127,7 @@ pub const Tree = struct {
         var len: usize = 0;
         var cur: ?*Node = n;
         while (cur) |c| : (cur = c.parent) {
+            if (len == path.len) break; // absurdly deep tree: stop rather than overflow
             path[len] = c;
             len += 1;
         }
@@ -154,3 +155,25 @@ pub const Tree = struct {
         }
     }
 };
+
+test "bsp insert, remove, geometry" {
+    var t = Tree{ .gpa = std.testing.allocator };
+    const area = Rect{ .x = 0, .y = 0, .w = 1000, .h = 600 };
+    const a = try t.insert(null, 1, area);
+    const b = try t.insert(a, 2, area);
+    const c = try t.insert(b, 3, area);
+    var list: [Tree.max_leaves]Tree.Entry = undefined;
+    var len: usize = 0;
+    Tree.collect(t.root, area, &list, &len);
+    try std.testing.expectEqual(@as(usize, 3), len);
+    var covered: u64 = 0; // leaves tile the area exactly
+    for (list[0..len]) |e| covered += @as(u64, e.rect.w) * e.rect.h;
+    try std.testing.expectEqual(@as(u64, 1000 * 600), covered);
+
+    try std.testing.expect(t.find(2) == b);
+    const next = t.remove(c).?;
+    try std.testing.expect(next.isLeaf());
+    _ = t.remove(b);
+    _ = t.remove(a);
+    try std.testing.expect(t.root == null);
+}

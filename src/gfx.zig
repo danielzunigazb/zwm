@@ -9,6 +9,34 @@ pub const glyph_w = 8;
 pub const glyph_h = 16;
 const psf_header = 32; // PSF2 header, then 256 glyphs of 16 bytes
 
+/// True when JetBrains Mono loaded, i.e. text can be real UTF-8 instead of the bitmap font's ASCII.
+pub fn hasTtf() bool {
+    return ttf.get(false) != null;
+}
+
+/// Number of UTF-8 code points (invalid bytes count as one each).
+pub fn cpCount(s: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) : (n += 1) i += cpLen(s, i);
+    return n;
+}
+
+fn cpLen(s: []const u8, i: usize) usize {
+    const l = std.unicode.utf8ByteSequenceLength(s[i]) catch return 1;
+    if (i + l > s.len) return 1;
+    _ = std.unicode.utf8Decode(s[i..][0..l]) catch return 1;
+    return l;
+}
+
+/// Byte offset of the `n`-th code point (or s.len).
+pub fn cpOffset(s: []const u8, n: usize) usize {
+    var i: usize = 0;
+    var k: usize = 0;
+    while (i < s.len and k < n) : (k += 1) i += cpLen(s, i);
+    return i;
+}
+
 pub fn blend(dst: u32, src: u32, cov: f32) u32 {
     if (cov >= 1) return src;
     if (cov <= 0) return dst;
@@ -96,17 +124,36 @@ pub const Canvas = struct {
         }
     }
 
-    /// Rounded rect with antialiased corners.
+    /// Rounded rect with antialiased corners. Only the corner squares pay for coverage math;
+    /// the rest is plain row fills.
     pub fn roundRect(cv: *Canvas, x: i32, y: i32, w: i32, h: i32, r: f32, color: u32) void {
-        var yy: i32 = @max(y, 0);
-        const y1 = @min(y + h, cv.h);
+        if (w <= 0 or h <= 0) return;
+        const ri: i32 = @min(@as(i32, @intFromFloat(@ceil(r))), @divTrunc(@min(w, h), 2));
+        const y0 = @max(y, 0);
+        const y1 = @min(y + h, @as(i32, cv.h));
         const x0 = @max(x, 0);
-        const x1 = @min(x + w, cv.w);
+        const x1 = @min(x + w, @as(i32, cv.w));
+        var yy: i32 = y0;
         while (yy < y1) : (yy += 1) {
+            const ry = yy - y;
+            const in_corner_rows = ry < ri or ry >= h - ri;
+            // Columns [cx0, cx1) are fully inside whenever this row is outside the corner bands.
+            const cx0 = if (in_corner_rows) x + ri else x0;
+            const cx1 = if (in_corner_rows) x + w - ri else x1;
+            const fx0 = std.math.clamp(cx0, x0, x1);
+            const fx1 = std.math.clamp(cx1, x0, x1);
+            const row = @as(usize, @intCast(yy)) * cv.w;
+            if (fx1 > fx0) @memset(cv.buf[row + @as(usize, @intCast(fx0)) ..][0..@intCast(fx1 - fx0)], color);
+            if (!in_corner_rows) continue;
             var xx: i32 = x0;
             while (xx < x1) : (xx += 1) {
-                const cov = roundCoverage(@floatFromInt(xx - x), @floatFromInt(yy - y), @floatFromInt(w), @floatFromInt(h), r);
-                const i = @as(usize, @intCast(yy)) * cv.w + @as(usize, @intCast(xx));
+                if (xx >= fx0 and xx < fx1) {
+                    xx = fx1 - 1;
+                    continue;
+                }
+                const cov = roundCoverage(@floatFromInt(xx - x), @floatFromInt(ry), @floatFromInt(w), @floatFromInt(h), r);
+                if (cov <= 0) continue;
+                const i = row + @as(usize, @intCast(xx));
                 cv.buf[i] = blend(cv.buf[i], color, cov);
             }
         }
@@ -229,21 +276,17 @@ pub const Canvas = struct {
             py = y;
         }
     }
-    /// Like textFit but at an explicit baseline and 13px (bold optional); cuts UTF-8 on a boundary.
+    /// Like textFit but at an explicit baseline and 13px (bold optional).
     pub fn textFit13(cv: *Canvas, x: i32, base: i32, s: []const u8, max_chars: usize, color: u32, bold: bool) i32 {
-        if (s.len <= max_chars) return cv.textAt(x, base, s, color, 13, bold);
-        var keep = if (max_chars > 3) max_chars - 3 else 0;
-        while (keep > 0 and keep < s.len and (s[keep] & 0xc0) == 0x80) keep -= 1;
+        if (cpCount(s) <= max_chars) return cv.textAt(x, base, s, color, 13, bold);
+        const keep = cpOffset(s, if (max_chars > 3) max_chars - 3 else 0);
         const nx = cv.textAt(x, base, s[0..keep], color, 13, bold);
         return cv.textAt(nx, base, "...", color, 13, bold);
     }
 
-    /// Draw `s` clipped to `max_chars`, ending in "..." when cut.
+    /// Draw `s` clipped to `max_chars` code points, ending in "..." when cut.
     pub fn textFit(cv: *Canvas, x: i32, y: i32, s: []const u8, max_chars: usize, color: u32) i32 {
-        if (s.len <= max_chars) return cv.text(x, y, s, color);
-        const keep = if (max_chars > 3) max_chars - 3 else 0;
-        const nx = cv.text(x, y, s[0..keep], color);
-        return cv.text(nx, y, "...", color);
+        return cv.textFit13(x, y + 12, s, max_chars, color, false);
     }
 };
 
@@ -327,7 +370,8 @@ pub const Surface = struct {
 
     /// Push the canvas to the window (also used to answer Expose).
     pub fn flush(s: *Surface) void {
-        const rows_per: usize = 16;
+        // Keep every PutImage well under the 256K request limit even on wide surfaces.
+        const rows_per: usize = @max(1, 200_000 / (@as(usize, s.cv.w) * 4));
         var y: usize = 0;
         while (y < s.cv.h) : (y += rows_per) {
             const n = @min(rows_per, s.cv.h - y);
