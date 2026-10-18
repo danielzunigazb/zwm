@@ -1,0 +1,30 @@
+#!/bin/sh
+# zwm X11 session: prepare the environment, then replace this shell with the WM.
+
+export XDG_SESSION_TYPE=x11
+export XDG_CURRENT_DESKTOP=zwm
+export XDG_SESSION_DESKTOP=zwm
+
+# The WM and the apps it starts need a session bus (notifications, MPRIS, NetworkManager).
+runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && [ -S "$runtime/bus" ]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
+fi
+if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session -- "$0" "$@"
+fi
+
+# Let D-Bus-activated and systemd user services see this display.
+command -v dbus-update-activation-environment >/dev/null 2>&1 &&
+    dbus-update-activation-environment --systemd DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+
+# Without this X shows its default "X" cursor on the empty desktop.
+command -v xsetroot >/dev/null 2>&1 && xsetroot -cursor_name left_ptr
+
+[ -f "$HOME/.Xresources" ] && command -v xrdb >/dev/null 2>&1 && xrdb -merge "$HOME/.Xresources"
+
+# Put your own startup (polkit agent, wallpaper, picom, ...) in here.
+autostart="${XDG_CONFIG_HOME:-$HOME/.config}/zwm/autostart"
+[ -x "$autostart" ] && "$autostart" &
+
+exec zwm

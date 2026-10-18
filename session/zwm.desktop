@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=zwm
+Comment=Custom tiling window manager (Zig, X11)
+Exec=/usr/local/bin/zwm-session
+TryExec=/usr/local/bin/zwm
+Type=Application
+DesktopNames=zwm
