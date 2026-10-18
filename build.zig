@@ -10,6 +10,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // ReleaseSafe turns on glibc's fortify wrappers, which translate-c cannot import.
+    mod.addCMacro("_FORTIFY_SOURCE", "0");
     mod.linkSystemLibrary("xcb", .{});
     mod.linkSystemLibrary("xcb-keysyms", .{});
     mod.linkSystemLibrary("xcb-shape", .{});
