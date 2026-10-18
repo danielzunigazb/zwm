@@ -4,6 +4,8 @@ pub const c = @cImport({
     @cInclude("xcb/shape.h");
     @cInclude("systemd/sd-bus.h");
     @cInclude("unistd.h");
+    @cInclude("stdlib.h");
+    @cInclude("dirent.h");
     @cInclude("fcntl.h");
     @cInclude("poll.h");
     @cInclude("time.h");

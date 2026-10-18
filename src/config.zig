@@ -21,7 +21,7 @@ pub const terminal = "xterm";
 pub const Dir4 = enum { left, up, right, down };
 pub const workspaces = 5;
 
-pub const Action = enum { spawn_terminal, close, quit, focus, swap, resize, workspace, send_to, toggle_panel, music_toggle, music_next, music_prev, volume };
+pub const Action = enum { spawn_terminal, close, quit, focus, swap, resize, workspace, send_to, toggle_panel, music_toggle, music_next, music_prev, volume, launcher };
 
 // Extra modifier bits on top of mod_mask.
 const shift: u16 = 1;
@@ -47,6 +47,7 @@ const base = [_]Bind{
     .{ .keysym = 0xff0d, .action = .spawn_terminal }, // Return
     .{ .keysym = 'q', .action = .close },
     .{ .keysym = ' ', .action = .toggle_panel },
+    .{ .mod = false, .extra = alt, .keysym = ' ', .action = .launcher }, // Alt+Space
 
     // Media keys (no modifier): XF86Audio{Mute,LowerVolume,RaiseVolume,Prev,Play,Next}.
     .{ .mod = false, .keysym = 0x1008ff12, .action = .volume, .cmd = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle" },

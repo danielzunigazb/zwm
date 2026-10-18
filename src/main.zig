@@ -7,6 +7,7 @@ const panel_mod = @import("panel.zig");
 const store_mod = @import("store.zig");
 const dbus_mod = @import("dbus.zig");
 const sys = @import("sys.zig");
+const Launcher = @import("launcher.zig").Launcher;
 
 const Tree = tree_mod.Tree;
 const Node = tree_mod.Node;
@@ -23,6 +24,8 @@ const WM = struct {
     widget: panel_mod.Widget,
     panel: panel_mod.Panel,
     toasts: panel_mod.Toasts,
+    launcher: Launcher,
+    syms: ?*c.xcb_key_symbols_t = null,
     store: store_mod.Store = .{},
     dbus: dbus_mod.Dbus = .{},
     last_minute: i64 = 0,
@@ -44,8 +47,8 @@ const WM = struct {
     }
 
     fn grabKeys(wm: *WM) void {
-        const syms = c.xcb_key_symbols_alloc(wm.conn);
-        defer c.xcb_key_symbols_free(syms);
+        const syms = c.xcb_key_symbols_alloc(wm.conn); // kept for the launcher's key translation
+        wm.syms = syms;
         // Also grab with NumLock (mod2) / CapsLock (lock) so they don't break binds.
         const extra = [_]u16{ 0, 2, 16, 18 };
         for (cfg.binds, 0..) |b, i| {
@@ -256,6 +259,10 @@ const WM = struct {
     }
 
     fn onKey(wm: *WM, ev: *c.xcb_key_press_event_t) void {
+        if (wm.launcher.visible()) { // keyboard is grabbed: everything goes to the launcher
+            wm.launcherResult(wm.launcher.onKey(ev));
+            return;
+        }
         const state = ev.state & ~@as(u16, 2 | 16); // drop lock bits
         for (cfg.binds, 0..) |b, i| {
             const m = (if (b.mod) cfg.mod_mask else 0) | b.extra;
@@ -272,6 +279,9 @@ const WM = struct {
                 .toggle_panel => {
                     wm.panel.toggle(&wm.store);
                     wm.toasts.last_version -%= 1; // toasts shift aside when the panel opens
+                },
+                .launcher => if (wm.syms) |syms| {
+                    _ = wm.launcher.open(syms);
                 },
                 .music_toggle => wm.dbus.control("PlayPause"),
                 .music_next => wm.dbus.control("Next"),
@@ -318,6 +328,7 @@ const WM = struct {
                 wm.manage(@as(*c.xcb_map_request_event_t, @ptrCast(@alignCast(ev))).window);
                 wm.panel.raise();
                 wm.toasts.raise();
+                wm.launcher.raise();
             },
             c.XCB_UNMAP_NOTIFY => wm.onUnmap(@as(*c.xcb_unmap_notify_event_t, @ptrCast(@alignCast(ev))).window),
             c.XCB_DESTROY_NOTIFY => wm.unmanage(@as(*c.xcb_destroy_notify_event_t, @ptrCast(@alignCast(ev))).window),
@@ -330,6 +341,7 @@ const WM = struct {
                 wm.widget.expose(e.window);
                 wm.panel.expose(e.window);
                 wm.toasts.expose(e.window);
+                wm.launcher.expose(e.window);
             },
             c.XCB_BUTTON_PRESS => wm.onClick(@ptrCast(@alignCast(ev))),
             c.XCB_ENTER_NOTIFY => {
@@ -349,8 +361,25 @@ const WM = struct {
         wm.bar.draw(wm.cur, occupied, &wm.store.status, force);
     }
 
+    fn launcherResult(wm: *WM, r: @import("launcher.zig").Result) void {
+        switch (r) {
+            .none => {},
+            .close => wm.launcher.close(),
+            .launch => {
+                sys.spawn(wm.launcher.cmdZ());
+                wm.launcher.close();
+            },
+            .calc => {
+                _ = wm.store.add("calc", wm.launcher.calcText(), "", 0, 8000, panel_mod.nowMs());
+                wm.launcher.close();
+            },
+        }
+    }
+
     fn onClick(wm: *WM, e: *c.xcb_button_press_event_t) void {
-        if (wm.toasts.idAt(e.event)) |id| {
+        if (wm.launcher.visible()) {
+            wm.launcherResult(wm.launcher.click(e.event, e.event_y));
+        } else if (wm.toasts.idAt(e.event)) |id| {
             wm.store.dropToast(id);
         } else if (wm.panel.hit(e.event, e.event_x, e.event_y)) |click| switch (click) {
             .prev => wm.dbus.control("Previous"),
@@ -452,6 +481,7 @@ pub fn main() !void {
         .widget = try panel_mod.Widget.init(conn, &screen),
         .panel = .{ .conn = conn, .screen = screen },
         .toasts = .{ .conn = conn, .screen = screen },
+        .launcher = .{ .conn = conn, .screen = screen },
         .tree = .{ .gpa = std.heap.c_allocator },
         .saved = [_]Saved{.{ .tree = .{ .gpa = std.heap.c_allocator } }} ** cfg.workspaces,
         .wm_protocols = WM.atom(conn, "WM_PROTOCOLS"),
