@@ -362,9 +362,9 @@ pub const Brightness = struct {
     }
 };
 
-/// Spotify playing on another device (phone, other PC): `zwm-music watch` is a long-lived child that
-/// prints one line per poll of the Web API; its stdout is polled like the other helpers'. Between
-/// lines the progress is interpolated, so the bar moves without asking Spotify every second.
+/// Spotify playing on another device (phone, other PC): `zwm-watch` (src/watch.zig) is a long-lived
+/// child that prints one line per poll of the Web API; its stdout is polled like the other helpers'.
+/// Between lines the progress is interpolated, so the bar moves without asking Spotify every second.
 pub const Remote = struct {
     fd: c_int = -1,
     pid: c.pid_t = 0,
@@ -400,8 +400,8 @@ pub const Remote = struct {
                 _ = c.dup2(null_fd, 2);
             }
             _ = c.dup2(fds[1], 1);
-            const argv = [_:null]?[*:0]const u8{ "zwm-music", "watch" };
-            _ = c.execvp("zwm-music", @ptrCast(&argv));
+            const argv = [_:null]?[*:0]const u8{ "zwm-watch" };
+            _ = c.execvp("zwm-watch", @ptrCast(&argv));
             c._exit(127);
         }
         _ = c.close(fds[1]);

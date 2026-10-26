@@ -445,9 +445,10 @@ reproducción) y una app propia, gratis:
 `/usr/local/bin`). Las órdenes se interpretan en `src/intent.zig`; lo que escribes viaja entre comillas
 simples, nunca lo interpreta el shell.
 
-**Lo que suena en otros dispositivos.** Con Spotify autorizado, el WM lanza `zwm-music watch` al
-arrancar: pregunta a la Web API cada 3 s (6 s en pausa, 10 s si no hay nada) y la tarjeta del panel y la
-línea del widget muestran lo que suene en el móvil u otro PC. Los botones ⏮ ⏯ ⏭ y las teclas multimedia
+**Lo que suena en otros dispositivos.** Con Spotify autorizado, el WM lanza `zwm-watch` al arrancar
+(`src/watch.zig`, un binario estático en Zig que instala `install.sh`; ocupa ~1 MB de RAM y mantiene una
+sola conexión TLS abierta): pregunta a la Web API cada 3 s (6 s en pausa, 10 s si no hay nada) y la tarjeta
+del panel y la línea del widget muestran lo que suene en el móvil u otro PC. Los botones ⏮ ⏯ ⏭ y las teclas multimedia
 controlan entonces a ese dispositivo vía Spotify, no MPRIS. Prioridad: un reproductor local sonando >
 Spotify sonando en otro dispositivo > lo que esté en pausa. Sin autorizar, el watcher termina solo y se
 reintenta cada minuto.

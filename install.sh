@@ -6,7 +6,7 @@ set -e
 cd "$(dirname "$0")"
 
 if [ "$1" = "uninstall" ]; then
-    sudo rm -f /usr/local/bin/zwm /usr/local/bin/zwm-session /usr/local/bin/zwm-music /usr/share/xsessions/zwm.desktop /usr/local/share/zwm/zwm.Xresources
+    sudo rm -f /usr/local/bin/zwm /usr/local/bin/zwm-session /usr/local/bin/zwm-music /usr/local/bin/zwm-watch /usr/share/xsessions/zwm.desktop /usr/local/share/zwm/zwm.Xresources
     sudo rmdir /usr/local/share/zwm 2>/dev/null || true
     echo "zwm removed."
     exit 0
@@ -16,6 +16,7 @@ zig build -Drelease
 sudo install -Dm755 zig-out/bin/wm /usr/local/bin/zwm
 sudo install -Dm755 session/zwm-session /usr/local/bin/zwm-session
 sudo install -Dm755 session/zwm-music /usr/local/bin/zwm-music
+sudo install -Dm755 zig-out/bin/zwm-watch /usr/local/bin/zwm-watch
 sudo install -Dm644 session/zwm.Xresources /usr/local/share/zwm/zwm.Xresources
 sudo install -Dm644 session/zwm.desktop /usr/share/xsessions/zwm.desktop
 # Per-user autostart (Claude at login). Never overwrites one you already have.

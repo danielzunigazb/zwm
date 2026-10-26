@@ -26,9 +26,33 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{ .name = "wm", .root_module = mod });
     b.installArtifact(exe);
 
+    // The Spotify watcher the WM starts: a static musl binary (no glibc to map, no dynamic loader),
+    // single-threaded, nothing but std. ReleaseSmall: ~1 MB resident vs ~1.9 MB in ReleaseSafe, and it
+    // only parses replies from api.spotify.com over verified TLS.
+    const watch = b.addExecutable(.{ .name = "zwm-watch", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/watch.zig"),
+        .target = b.resolveTargetQuery(.{ .abi = .musl }),
+        .optimize = .ReleaseSmall,
+        .link_libc = true,
+        .single_threaded = true,
+        .strip = true,
+        .unwind_tables = .none,
+    }) });
+    b.installArtifact(watch);
+
     // `zig build test` runs the pure-logic unit tests (calculator, sanitizer, fuzzy search, ...).
     const tests = b.addTest(.{ .root_module = mod });
-    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+    // The watcher's tests run with safety checks on, unlike the shipped ReleaseSmall binary.
+    const watch_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/watch.zig"),
+        .target = b.resolveTargetQuery(.{ .abi = .musl }),
+        .optimize = optimize,
+        .link_libc = true,
+        .single_threaded = true,
+    }) });
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    test_step.dependOn(&b.addRunArtifact(watch_tests).step);
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
