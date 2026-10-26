@@ -362,6 +362,157 @@ pub const Brightness = struct {
     }
 };
 
+/// Spotify playing on another device (phone, other PC): `zwm-music watch` is a long-lived child that
+/// prints one line per poll of the Web API; its stdout is polled like the other helpers'. Between
+/// lines the progress is interpolated, so the bar moves without asking Spotify every second.
+pub const Remote = struct {
+    fd: c_int = -1,
+    pid: c.pid_t = 0,
+    buf: [1024]u8 = undefined,
+    len: usize = 0,
+    overflow: bool = false, // the current line did not fit: drop it up to the next newline
+    base_us: i64 = 0, // position when the last line arrived
+    stamp_ms: i64 = 0,
+
+    pub fn pollFd(r: *const Remote) c_int {
+        return r.fd;
+    }
+
+    /// Start the watcher unless it runs. It exits at once when Spotify is not authorised, so this is
+    /// called once a minute rather than in a loop.
+    pub fn ensure(r: *Remote) void {
+        if (r.fd >= 0) return;
+        var fds: [2]c_int = undefined;
+        if (c.pipe(&fds) != 0) return;
+        _ = c.fcntl(fds[0], c.F_SETFD, c.FD_CLOEXEC);
+        _ = c.fcntl(fds[1], c.F_SETFD, c.FD_CLOEXEC);
+        _ = c.fcntl(fds[0], c.F_SETFL, c.O_NONBLOCK);
+        const pid = c.fork();
+        if (pid < 0) {
+            _ = c.close(fds[0]);
+            _ = c.close(fds[1]);
+            return;
+        }
+        if (pid == 0) {
+            const null_fd = c.open("/dev/null", c.O_RDWR);
+            if (null_fd >= 0) {
+                _ = c.dup2(null_fd, 0);
+                _ = c.dup2(null_fd, 2);
+            }
+            _ = c.dup2(fds[1], 1);
+            const argv = [_:null]?[*:0]const u8{ "zwm-music", "watch" };
+            _ = c.execvp("zwm-music", @ptrCast(&argv));
+            c._exit(127);
+        }
+        _ = c.close(fds[1]);
+        r.fd = fds[0];
+        r.pid = pid;
+        r.len = 0;
+        r.overflow = false;
+    }
+
+    pub fn service(r: *Remote, st: *store.Store, now_ms: i64) void {
+        if (r.fd < 0) return;
+        while (true) {
+            var scratch: [512]u8 = undefined;
+            const n = c.read(r.fd, &scratch, scratch.len);
+            if (n > 0) {
+                for (scratch[0..@intCast(n)]) |b| {
+                    if (b == '\n') {
+                        if (!r.overflow) r.line(st, r.buf[0..r.len], now_ms);
+                        r.len = 0;
+                        r.overflow = false;
+                    } else if (r.len < r.buf.len) {
+                        r.buf[r.len] = b;
+                        r.len += 1;
+                    } else r.overflow = true;
+                }
+                continue;
+            }
+            if (n < 0) {
+                const e = c.__errno_location().*;
+                if (e == c.EAGAIN or e == c.EINTR) return; // watcher still running
+            }
+            break;
+        }
+        _ = c.close(r.fd);
+        r.fd = -1;
+        _ = c.waitpid(r.pid, null, 0);
+        st.music_remote = .{}; // without the watcher there is nothing to show
+        st.mergeMusic();
+    }
+
+    /// "P|p<TAB>title<TAB>artist<TAB>cover<TAB>pos ms<TAB>len ms<TAB>device", or "-" for nothing.
+    fn line(r: *Remote, st: *store.Store, text: []const u8, now_ms: i64) void {
+        st.music_remote = parseLine(text);
+        r.base_us = st.music_remote.pos_us;
+        r.stamp_ms = now_ms;
+        st.mergeMusic();
+    }
+
+    /// Advance the shown position by the time since the last line. No-op unless Spotify is what's shown.
+    pub fn tick(r: *Remote, st: *store.Store, now_ms: i64) void {
+        if (!st.music.remote or !st.music.playing) return;
+        var pos = r.base_us + (now_ms - r.stamp_ms) * 1000;
+        if (st.music.len_us > 0) pos = @min(pos, st.music.len_us);
+        st.music_remote.pos_us = pos;
+        st.music.pos_us = pos;
+    }
+
+    /// A transport button was pressed: show the pause/play change now, not at the next poll.
+    pub fn toggled(r: *Remote, st: *store.Store, now_ms: i64) void {
+        if (!st.music_remote.have) return;
+        r.tick(st, now_ms); // freeze/continue from where the bar is
+        r.base_us = st.music_remote.pos_us;
+        r.stamp_ms = now_ms;
+        st.music_remote.playing = !st.music_remote.playing;
+        st.mergeMusic();
+    }
+};
+
+fn parseLine(text: []const u8) store.Music {
+    var m = store.Music{};
+    var it = std.mem.splitScalar(u8, text, '\t');
+    const state = it.next() orelse return m;
+    if (state.len != 1 or (state[0] != 'P' and state[0] != 'p')) return m;
+    const title = it.next() orelse return m;
+    const artist = it.next() orelse return m;
+    const cover = it.next() orelse return m;
+    const pos_ms = std.fmt.parseInt(i64, it.next() orelse return m, 10) catch return m;
+    const len_ms = std.fmt.parseInt(i64, it.next() orelse return m, 10) catch return m;
+    const device = it.next() orelse "";
+
+    m.have = true;
+    m.remote = true;
+    m.playing = state[0] == 'P';
+    m.title_len = store.sanitize(&m.title, title);
+    // The device goes after the artist so it is clear this is not playing on this PC.
+    var ab: [160]u8 = undefined;
+    const shown = if (device.len > 0) std.fmt.bufPrint(&ab, "{s} \xc2\xb7 {s}", .{ artist, device }) catch artist else artist;
+    m.artist_len = store.sanitize(&m.artist, shown);
+    m.art_url_len = store.sanitize(&m.art_url, cover);
+    m.pos_us = @max(pos_ms, 0) * 1000;
+    m.len_us = @max(len_ms, 0) * 1000;
+    return m;
+}
+
+test "parseLine: a Spotify line becomes remote music, anything else is nothing" {
+    const m = parseLine("P\tDtMF\tBad Bunny\thttps://i.scdn.co/image/x\t1500\t200000\tOPPO A60");
+    try std.testing.expect(m.have and m.remote and m.playing);
+    try std.testing.expectEqualStrings("DtMF", m.titleSlice());
+    try std.testing.expectEqualStrings("https://i.scdn.co/image/x", m.artUrlSlice());
+    try std.testing.expectEqual(@as(i64, 1_500_000), m.pos_us);
+    try std.testing.expectEqual(@as(i64, 200_000_000), m.len_us);
+    try std.testing.expect(std.mem.startsWith(u8, m.artistSlice(), "Bad Bunny"));
+    try std.testing.expect(std.mem.indexOf(u8, m.artistSlice(), "OPPO A60") != null);
+
+    try std.testing.expect(!parseLine("p\ta\tb\t\t0\t10\tdev").playing);
+    try std.testing.expect(!parseLine("-").have);
+    try std.testing.expect(!parseLine("").have);
+    try std.testing.expect(!parseLine("P\tonly\ttwo").have);
+    try std.testing.expect(!parseLine("P\ta\tb\tc\tnope\t1\td").have);
+}
+
 test "artSource: file URLs are decoded, anything else is refused" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("/tmp/a b/c.png", artSource("file:///tmp/a%20b/c.png", &buf).?);

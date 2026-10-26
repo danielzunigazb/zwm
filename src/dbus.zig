@@ -136,24 +136,30 @@ pub const Dbus = struct {
     pub fn refreshMusic(d: *Dbus) void {
         const st = d.store;
         st.music_dirty = false;
-        defer st.version +%= 1;
-        const m = &st.music;
+        const m = &st.music_local;
         m.* = .{};
+        defer st.mergeMusic();
         if (d.session == null or !d.pickPlayer()) return;
         m.have = true;
         m.playing = d.playbackIs(d.playerZ(), "Playing");
         d.readMetadata(m);
-        d.refreshPosition();
+        d.readPosition(m);
     }
 
+    /// Once a second while the panel shows a local player's progress.
     pub fn refreshPosition(d: *Dbus) void {
+        d.readPosition(&d.store.music_local);
+        d.store.music.pos_us = d.store.music_local.pos_us;
+    }
+
+    fn readPosition(d: *Dbus, m: *store_mod.Music) void {
         const bus = d.session orelse return;
         if (d.player_len == 0) return;
         var err = std.mem.zeroes(c.sd_bus_error);
         defer c.sd_bus_error_free(&err);
         var pos: i64 = 0;
         if (c.sd_bus_get_property_trivial(bus, d.playerZ(), mpris_path, player_iface, "Position", &err, 'x', &pos) >= 0) {
-            d.store.music.pos_us = pos;
+            m.pos_us = pos;
         }
     }
 

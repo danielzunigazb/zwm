@@ -53,6 +53,7 @@ const WM = struct {
     vol: sys.Volume = .{},
     art: sys.Art = .{},
     brightness: sys.Brightness = .{},
+    remote: sys.Remote = .{},
     apps_warm: bool = false,
     last_ns: i64 = 0,
 
@@ -599,9 +600,9 @@ const WM = struct {
                     if (!wm.launcher.open(syms)) wm.notify("No se pudo abrir el lanzador", "Otra aplicación tiene el teclado.");
                 },
                 .lock => wm.lockScreen(),
-                .music_toggle => wm.dbus.control("PlayPause"),
-                .music_next => wm.dbus.control("Next"),
-                .music_prev => wm.dbus.control("Previous"),
+                .music_toggle => wm.musicControl(.toggle),
+                .music_next => wm.musicControl(.next),
+                .music_prev => wm.musicControl(.prev),
                 .volume => wm.vol.request(b.cmd),
                 .brightness => sys.spawn(b.cmd),
             }
@@ -732,11 +733,30 @@ const WM = struct {
         } else if (wm.toasts.idAt(e.event)) |id| {
             wm.store.dropToast(id);
         } else if (wm.panel.hit(e.event, e.event_x, e.event_y)) |click| switch (click) {
-            .prev => wm.dbus.control("Previous"),
-            .play => wm.dbus.control("PlayPause"),
-            .next => wm.dbus.control("Next"),
+            .prev => wm.musicControl(.prev),
+            .play => wm.musicControl(.toggle),
+            .next => wm.musicControl(.next),
             .dismiss => |id| wm.store.dismiss(id),
         };
+    }
+
+    /// Transport buttons and media keys: MPRIS for a player on this PC, zwm-music (Spotify Connect)
+    /// when what the panel shows is playing on another device.
+    fn musicControl(wm: *WM, what: enum { toggle, next, prev }) void {
+        if (!wm.store.music.remote) {
+            wm.dbus.control(switch (what) {
+                .toggle => "PlayPause",
+                .next => "Next",
+                .prev => "Previous",
+            });
+            return;
+        }
+        sys.spawn(switch (what) {
+            .toggle => if (wm.store.music.playing) "zwm-music pause" else "zwm-music resume",
+            .next => "zwm-music next",
+            .prev => "zwm-music prev",
+        });
+        if (what == .toggle) wm.remote.toggled(&wm.store, panel_mod.nowMs());
     }
 
     fn minuteNow() i64 {
@@ -750,6 +770,7 @@ const WM = struct {
             wm.last_minute = minute;
             wm.vol.request(null);
             wm.store.net_dirty = true; // e.g. ethernet plugged in while connected: no StateChanged
+            wm.remote.ensure(); // also restarts the Spotify watcher if it died or Spotify was authorised since
         }
         if (wm.store.music_dirty) wm.dbus.refreshMusic();
         // The cover is only fetched while the panel is open, and dropped when nothing plays.
@@ -757,7 +778,7 @@ const WM = struct {
         if (wm.store.net_dirty) wm.dbus.refreshNet();
         if (wm.panel.visible() and wm.store.music.playing and now - wm.last_pos_ms >= 1000) {
             wm.last_pos_ms = now;
-            wm.dbus.refreshPosition();
+            if (wm.store.music.remote) wm.remote.tick(&wm.store, now) else wm.dbus.refreshPosition();
         }
     }
 
@@ -796,12 +817,13 @@ const WM = struct {
     }
 
     fn run(wm: *WM) void {
-        var pfd: [6]c.struct_pollfd = undefined;
+        var pfd: [8]c.struct_pollfd = undefined;
         wm.last_minute = minuteNow();
         wm.redrawAll(true);
         _ = c.xcb_flush(wm.conn); // first paint before anything slow (volume probe, app scan)
         wm.vol.request(null);
         wm.brightness.request();
+        wm.remote.ensure();
         wm.runAutostart();
         while (wm.running) {
             while (c.xcb_poll_for_event(wm.conn)) |ev| {
@@ -813,6 +835,7 @@ const WM = struct {
             wm.vol.service(&wm.store.status);
             wm.art.service(&wm.store);
             const now = panel_mod.nowMs();
+            wm.remote.service(&wm.store, now);
             wm.refreshData(now);
             wm.brightness.service(&wm.store.status);
 
@@ -837,7 +860,8 @@ const WM = struct {
             pfd[n0] = .{ .fd = wm.vol.pollFd(), .events = c.POLLIN, .revents = 0 }; // -1 = ignored by poll
             pfd[n0 + 1] = .{ .fd = wm.brightness.pollFd(), .events = c.POLLIN, .revents = 0 };
             pfd[n0 + 2] = .{ .fd = wm.art.pollFd(), .events = c.POLLIN, .revents = 0 };
-            const n = n0 + 3;
+            pfd[n0 + 3] = .{ .fd = wm.remote.pollFd(), .events = c.POLLIN, .revents = 0 };
+            const n = n0 + 4;
             if (wm.animating) {
                 _ = anim.waitUntil(pfd[0..@intCast(n)], t0 + anim.frame_ns);
             } else {

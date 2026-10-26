@@ -309,9 +309,11 @@ mismo atajo. Tiene tres tarjetas:
 
 1. **Calendario.** Mes y año en el título, `sem N` (semana ISO) a la derecha, la cuadrícula de lunes a
    domingo y el día de hoy resaltado en azul.
-2. **Música.** Solo aparece si hay un reproductor MPRIS. Muestra la portada del álbum (esquinas
-   redondeadas), el título, el artista, los controles ⏮ ⏯ ⏭ junto a la portada y debajo una barra de
-   progreso con el tiempo transcurrido y la duración. La posición se actualiza cada segundo mientras suena.
+2. **Música.** Aparece si hay un reproductor MPRIS en este PC o si suena Spotify en otro dispositivo
+   (móvil, otro PC; ver [Música por teclado](#música-por-teclado-pon-)). Muestra la portada del álbum
+   (esquinas redondeadas), el título, el artista (con el dispositivo si no es este PC), los controles
+   ⏮ ⏯ ⏭ junto a la portada y debajo una barra de progreso con el tiempo transcurrido y la duración.
+   La posición se actualiza cada segundo mientras suena. Si ambos suenan a la vez, gana el de este PC.
 3. **Notificaciones.** La lista de las últimas notificaciones (hasta 16), con la aplicación, el resumen y
    el contador. Un clic descarta una.
 
@@ -441,8 +443,14 @@ reproducción) y una app propia, gratis:
 
 `zwm-music` es un script de Python sin dependencias (`session/zwm-music`, instalado por `install.sh` en
 `/usr/local/bin`). Las órdenes se interpretan en `src/intent.zig`; lo que escribes viaja entre comillas
-simples, nunca lo interpreta el shell. Limitación: la tarjeta de música del panel sólo ve reproductores
-locales (MPRIS), así que no muestra lo que suena en el móvil.
+simples, nunca lo interpreta el shell.
+
+**Lo que suena en otros dispositivos.** Con Spotify autorizado, el WM lanza `zwm-music watch` al
+arrancar: pregunta a la Web API cada 3 s (6 s en pausa, 10 s si no hay nada) y la tarjeta del panel y la
+línea del widget muestran lo que suene en el móvil u otro PC. Los botones ⏮ ⏯ ⏭ y las teclas multimedia
+controlan entonces a ese dispositivo vía Spotify, no MPRIS. Prioridad: un reproductor local sonando >
+Spotify sonando en otro dispositivo > lo que esté en pausa. Sin autorizar, el watcher termina solo y se
+reintenta cada minuto.
 
 ---
 

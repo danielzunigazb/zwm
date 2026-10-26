@@ -23,6 +23,9 @@ pub const Status = struct {
 pub const Music = struct {
     have: bool = false,
     playing: bool = false,
+    /// Comes from Spotify on another device (phone, other PC), not from a player on this machine:
+    /// the transport buttons then go through zwm-music instead of MPRIS.
+    remote: bool = false,
     title: [128]u8 = undefined,
     title_len: u8 = 0,
     artist: [96]u8 = undefined,
@@ -40,6 +43,14 @@ pub const Music = struct {
     }
     pub fn artUrlSlice(m: *const Music) []const u8 {
         return m.art_url[0..m.art_url_len];
+    }
+
+    /// Same thing on screen, ignoring the position (which has its own once-a-second repaint).
+    fn sameShown(a: *const Music, b: *const Music) bool {
+        return a.have == b.have and a.playing == b.playing and a.remote == b.remote and a.len_us == b.len_us and
+            std.mem.eql(u8, a.titleSlice(), b.titleSlice()) and
+            std.mem.eql(u8, a.artistSlice(), b.artistSlice()) and
+            std.mem.eql(u8, a.artUrlSlice(), b.artUrlSlice());
     }
 };
 
@@ -132,7 +143,10 @@ pub const Store = struct {
     version: u32 = 0,
     /// Bumped only when the notification list changes (toasts rebuild on this).
     notif_version: u32 = 0,
+    /// What the panel and widget show: see `mergeMusic`.
     music: Music = .{},
+    music_local: Music = .{}, // MPRIS player on this machine
+    music_remote: Music = .{}, // Spotify on another device, from `zwm-music watch`
     notifs: [max_notifs]Notif = undefined, // newest first
     count: usize = 0,
     next_id: u32 = 1,
@@ -140,6 +154,16 @@ pub const Store = struct {
 
     music_dirty: bool = true,
     net_dirty: bool = true,
+
+    /// Pick what to show: a local player that is playing wins (no point mirroring what this PC
+    /// plays), then Spotify playing elsewhere, then whichever is merely paused (local first).
+    pub fn mergeMusic(s: *Store) void {
+        const l = &s.music_local;
+        const r = &s.music_remote;
+        const next = if (r.have and (!l.have or (r.playing and !l.playing))) r else l;
+        if (!s.music.sameShown(next)) s.version +%= 1;
+        s.music = next.*;
+    }
 
     /// True when notification `id` is still shown and was sent by `owner` (a bus name).
     pub fn ownedBy(s: *const Store, id: u32, owner: []const u8) bool {
@@ -251,4 +275,31 @@ test "sanitize drops bidi overrides and zero-width characters" {
     // U+202E (right-to-left override) and U+200B (zero-width space) around plain text.
     const n = sanitize(&buf, "a\u{202E}b\u{200B}c");
     try std.testing.expectEqualStrings("abc", buf[0..n]);
+}
+
+test "mergeMusic: local playing wins, then Spotify elsewhere, then paused local" {
+    var s = Store{};
+    const local = Music{ .have = true, .playing = true };
+    const remote = Music{ .have = true, .playing = true, .remote = true };
+
+    s.music_remote = remote;
+    s.mergeMusic();
+    try std.testing.expect(s.music.remote);
+
+    s.music_local = local;
+    s.mergeMusic();
+    try std.testing.expect(!s.music.remote); // this PC plays: do not mirror the phone
+
+    s.music_local.playing = false;
+    s.mergeMusic();
+    try std.testing.expect(s.music.remote); // PC paused, phone playing
+
+    s.music_remote.playing = false;
+    s.mergeMusic();
+    try std.testing.expect(!s.music.remote); // both paused: the local player
+
+    s.music_local = .{};
+    s.music_remote = .{};
+    s.mergeMusic();
+    try std.testing.expect(!s.music.have);
 }

@@ -7,6 +7,7 @@ Spotify Web API / Connect. Called by the zwm launcher ("pon ...", "pausa", ...).
     zwm-music album 'query'      search an album and play it
     zwm-music pause | resume | next | prev
     zwm-music devices            list the devices Spotify can see
+    zwm-music watch              print what plays on any device, one line per poll (used by the zwm panel)
 
 Results are reported as desktop notifications (zwm is the notification server); on a terminal they
 are printed too. Standard library only. Needs Spotify Premium for playback control.
@@ -140,7 +141,10 @@ def call(conf, method, path, params=None, body=None, retry=True):
     try:
         with urllib.request.urlopen(req, timeout=8) as r:
             raw = r.read()
-            return r.status, (json.loads(raw) if raw else None)
+            try:
+                return r.status, (json.loads(raw) if raw.strip() else None)
+            except ValueError:  # control endpoints may answer 2xx with a plain-text body
+                return r.status, None
     except urllib.error.HTTPError as e:
         if e.code == 401 and retry:
             access_token(conf, force=True)
@@ -197,15 +201,32 @@ def now_playing(item, dev):
     notify(item["name"], " · ".join(x for x in (names(item), "en " + dev["name"]) if x))
 
 
+def started(conf):
+    """A 2xx from /play only means the request was queued; check that the device is really playing."""
+    for _ in range(4):
+        time.sleep(0.6)
+        status, data = call(conf, "GET", "/me/player")
+        if status == 200 and (data or {}).get("is_playing") and data.get("item"):
+            return True
+    return False
+
+
 def play(conf, kind, query):
     # "x de y" reads naturally but "de" is noise to the search.
     query = " ".join(query.replace(" de ", " ").split())
     item = search(conf, kind, query)
     dev = pick_device(conf)
-    body = {"uris": [item["uri"]]} if kind == "track" else {"context_uri": item["uri"]}
+    # Phones answer 204 to a bare {"uris": [...]} but stay paused, so a track is played as its album
+    # starting at that track.
+    if kind == "track":
+        body = {"context_uri": item["album"]["uri"], "offset": {"uri": item["uri"]}}
+    else:
+        body = {"context_uri": item["uri"]}
     status, data = call(conf, "PUT", "/me/player/play", {"device_id": dev["id"]}, body)
     if status not in (200, 202, 204):
         raise Fail(explain(status, data))
+    if not started(conf):
+        raise Fail(f"Spotify acepto «{item['name']}» pero {dev['name']} no empezo a sonar")
     now_playing(item, dev)
 
 
@@ -238,6 +259,51 @@ def list_devices(conf):
         print(("* " if d.get("is_active") else "  ") + f"{d['name']} ({d['type']})")
 
 
+def tidy(text):
+    return " ".join(str(text).split())  # one line, no tabs: the WM splits on tabs
+
+
+def watch_line(data):
+    """What /me/player says, as one tab-separated line:
+    state (P playing, p paused, - nothing), title, artist, cover URL, position ms, length ms, device."""
+    item = (data or {}).get("item")
+    if not item:
+        return "-"
+    if item.get("type") == "episode":
+        artist = (item.get("show") or {}).get("name", "")
+        images = (item.get("images") or (item.get("show") or {}).get("images") or [])
+    else:
+        artist = names(item)
+        images = (item.get("album") or {}).get("images") or []
+    cover = (images[1] if len(images) > 1 else images[0])["url"] if images else ""
+    state = "P" if data.get("is_playing") else "p"
+    device = (data.get("device") or {}).get("name", "")
+    return "\t".join([state, tidy(item.get("name", "")), tidy(artist), cover, str(data.get("progress_ms") or 0), str(item.get("duration_ms") or 0), tidy(device)])
+
+
+def watch(conf):
+    """Print what is playing on any of the user's Spotify devices (phone, other PC...), once per poll.
+    The zwm panel reads this; it ends when the panel goes away (broken pipe)."""
+    if not conf.get("refresh_token"):
+        return 1  # not logged in: nothing to watch, and the WM must not be spammed with errors
+    while True:
+        wait = 10
+        try:
+            status, data = call(conf, "GET", "/me/player", {"additional_types": "episode"})
+            if status == 429:
+                wait, line = 30, None
+            elif status == 200 and data:
+                line = watch_line(data)
+                wait = 3 if data.get("is_playing") else 6
+            else:
+                line = "-"  # 204: no device has played recently
+        except Fail:
+            line, wait = None, 15  # offline or token rejected: keep the last line, try again later
+        if line is not None:
+            print(line, flush=True)
+        time.sleep(wait)
+
+
 def main(argv):
     if not argv:
         print(__doc__, file=sys.stderr)
@@ -256,12 +322,17 @@ def main(argv):
             control(conf, verb)
         elif verb == "devices":
             list_devices(conf)
+        elif verb == "watch":
+            return watch(conf)
         else:
             print(__doc__, file=sys.stderr)
             return 2
     except Fail as e:
         notify("Musica", str(e))
         return 1
+    except (BrokenPipeError, KeyboardInterrupt):  # watch: the reader went away
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())  # so the exit flush is quiet
+        return 0
     return 0
 
 
