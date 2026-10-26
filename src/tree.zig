@@ -97,7 +97,9 @@ pub const Tree = struct {
     }
 
     pub const Entry = struct { node: *Node, rect: Rect };
-    pub const max_leaves = 64;
+    /// Windows per workspace that the geometry and focus code can see. Beyond this, collect() skips
+    /// leaves, so focus movement would ignore them; 256 is far past what fits on a screen anyway.
+    pub const max_leaves = 256;
 
     /// Flatten leaves with their (gapless) rects.
     pub fn collect(n: ?*Node, r: Rect, out: *[max_leaves]Entry, len: *usize) void {
@@ -113,11 +115,12 @@ pub const Tree = struct {
         collect(node.b, split(node, r, true), out, len);
     }
 
-    /// Nearest ancestor split along `dir`, plus whether `n` lies in its first child.
-    pub fn ancestor(n: *Node, dir: Dir) ?struct { split: *Node, in_a: bool } {
+    /// Nearest split along `dir` that has `n` on the side `want_a` (true = first child). Resizing
+    /// toward the right needs the leaf in the left child: its right edge is the divider.
+    pub fn ancestorOn(n: *Node, dir: Dir, want_a: bool) ?*Node {
         var child = n;
         while (child.parent) |p| : (child = p) {
-            if (p.dir == dir) return .{ .split = p, .in_a = p.a == child };
+            if (p.dir == dir and (p.a == child) == want_a) return p;
         }
         return null;
     }

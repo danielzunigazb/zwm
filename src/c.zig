@@ -15,4 +15,7 @@ pub const c = @cImport({
     @cInclude("time.h");
     @cInclude("stdio.h");
     @cInclude("sys/wait.h");
+    @cInclude("pwd.h");
+    @cInclude("string.h");
+    @cInclude("security/pam_appl.h");
 });

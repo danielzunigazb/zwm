@@ -5,4 +5,5 @@
 
 PATH="$HOME/.local/bin:$PATH"
 cd "$HOME/Proyectos" 2>/dev/null || cd "$HOME"
+setsid -f obsidian >/dev/null 2>&1   # Vault: ~/Obsidian/Workflow
 exec xterm -T claude -e sh -c 'claude --continue || exec claude'

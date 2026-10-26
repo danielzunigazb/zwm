@@ -1,5 +1,6 @@
 // App launcher: keyboard-grabbing list on the left side. Fuzzy-searches .desktop
-// apps; arithmetic typed in shows up as a calculator row.
+// apps; arithmetic typed in shows up as a calculator row, and music commands ("pon ...",
+// "pausa") as an action row that hands off to zwm-music.
 
 const std = @import("std");
 const cfg = @import("config.zig");
@@ -8,6 +9,7 @@ const gfx = @import("gfx.zig");
 const anim = @import("anim.zig");
 const apps = @import("apps.zig");
 const calc = @import("calc.zig");
+const intent_mod = @import("intent.zig");
 
 const glyph_w = gfx.glyph_w;
 const width: u16 = 360;
@@ -25,16 +27,17 @@ pub const Launcher = struct {
     surf: ?gfx.Surface = null,
     db: apps.Db = .{},
 
-    query: [64]u8 = undefined,
+    query: [128]u8 = undefined,
     qlen: usize = 0,
     matches: [max_results]apps.Db.Match = undefined,
     n_match: usize = 0,
     calc_val: ?f64 = null,
+    intent: ?intent_mod.Intent = null, // music command; `arg` points into `query`
     sel: usize = 0,
     x: f32 = 0, // animated left edge: slides in from off screen on open
 
     /// Last action's payload, valid until the next key.
-    cmd_buf: [320:0]u8 = [_:0]u8{0} ** 320,
+    cmd_buf: [640:0]u8 = [_:0]u8{0} ** 640, // fits a 128-byte query with every byte quoted
     calc_buf: [96]u8 = undefined,
     calc_len: usize = 0,
 
@@ -54,7 +57,11 @@ pub const Launcher = struct {
         l.qlen = 0;
         l.sel = 0;
         l.update();
-        l.rebuild();
+        if (!l.rebuild()) {
+            // No window: give the keyboard back instead of holding it for nothing.
+            _ = c.xcb_ungrab_keyboard(l.conn, c.XCB_CURRENT_TIME);
+            return false;
+        }
         return true;
     }
 
@@ -76,34 +83,42 @@ pub const Launcher = struct {
         return moving;
     }
 
+    /// Selectable rows: music action, calculator, then apps.
+    fn nrows(l: *const Launcher) usize {
+        return l.n_match + @intFromBool(l.calc_val != null) + @intFromBool(l.intent != null);
+    }
+
     fn rows(l: *const Launcher) usize {
-        const n = l.n_match + @intFromBool(l.calc_val != null);
-        return @max(n, 1);
+        return @max(l.nrows(), 1);
     }
 
     /// Recompute matches for the current query.
     fn update(l: *Launcher) void {
         const q = l.query[0..l.qlen];
         l.calc_val = calc.eval(q);
-        l.n_match = l.db.search(q, &l.matches);
+        l.intent = intent_mod.parse(q);
+        // "pon <song>" is not an app search: leave the list to the action row.
+        l.n_match = if (l.intent) |it| (if (it.takesArg()) 0 else l.db.search(q, &l.matches)) else l.db.search(q, &l.matches);
         l.sel = 0;
     }
 
     /// (Re)create the window at the height the current rows need, and paint it.
-    fn rebuild(l: *Launcher) void {
+    /// False when the window could not be created (the caller must drop the keyboard grab).
+    fn rebuild(l: *Launcher) bool {
         const h: u16 = @intCast(pad + input_h + 10 + l.rows() * row_h + pad - 2);
         if (l.surf) |*s| {
             if (s.cv.h != h) s.resize(&l.screen, h, 14); // grow/shrink in place: no flicker while typing
             l.draw();
-            return;
+            return true;
         }
         const gap: i32 = cfg.gap;
         l.x = -@as(f32, width);
-        var s = gfx.Surface.create(l.conn, &l.screen, anim.round(l.x), 2 * gap + cfg.bar_h, width, h, 14, c.XCB_EVENT_MASK_EXPOSURE | c.XCB_EVENT_MASK_BUTTON_PRESS, cfg.bar_bg) catch return;
+        var s = gfx.Surface.create(l.conn, &l.screen, anim.round(l.x), 2 * gap + cfg.bar_h, width, h, 14, c.XCB_EVENT_MASK_EXPOSURE | c.XCB_EVENT_MASK_BUTTON_PRESS, cfg.bar_bg) catch return false;
         s.map();
         s.setStack(true);
         l.surf = s;
         l.draw();
+        return true;
     }
 
     fn draw(l: *Launcher) void {
@@ -115,13 +130,31 @@ pub const Launcher = struct {
         const iw: i32 = width - 2 * pad;
         cv.roundRect(pad, pad, iw, input_h, 10, cfg.desktop_bg);
         _ = cv.text(pad + 14, pad + 11, ">", cfg.accent);
-        const tx = cv.text(pad + 14 + 2 * glyph_w, pad + 11, l.query[0..l.qlen], cfg.fg_bright);
+        // Long input (song titles): show its tail, where the cursor is.
+        const q = l.query[0..l.qlen];
+        const in_max: usize = @intCast(@divTrunc(iw - 28 - 3 * glyph_w, glyph_w));
+        const shown = if (q.len > in_max) q[q.len - in_max ..] else q;
+        const tx = cv.text(pad + 14 + 2 * glyph_w, pad + 11, shown, cfg.fg_bright);
         cv.rect(tx + 1, pad + 11, glyph_w, 16, cfg.accent);
 
-        // Rows: calculator first, then apps.
+        // Rows: music action, calculator, then apps.
         var y: i32 = pad + input_h + 10;
         var idx: usize = 0;
         const maxc: usize = @intCast(@divTrunc(iw - 28, glyph_w));
+        if (l.intent) |it| {
+            var lb: [192]u8 = undefined;
+            const text = switch (it.kind) {
+                .play => std.fmt.bufPrint(&lb, "Reproducir: {s}", .{it.arg}),
+                .album => std.fmt.bufPrint(&lb, "Disco: {s}", .{it.arg}),
+                .pause => std.fmt.bufPrint(&lb, "Pausar", .{}),
+                .resume_ => std.fmt.bufPrint(&lb, "Reanudar", .{}),
+                .next => std.fmt.bufPrint(&lb, "Siguiente", .{}),
+                .prev => std.fmt.bufPrint(&lb, "Anterior", .{}),
+            } catch lb[0..0]; // arg is at most 128 bytes: cannot overflow, but never crash drawing
+            l.row(cv, y, idx, text, maxc);
+            y += row_h;
+            idx += 1;
+        }
         if (l.calc_val) |v| {
             var nb: [48]u8 = undefined;
             var rb: [64]u8 = undefined;
@@ -164,13 +197,20 @@ pub const Launcher = struct {
         const top = pad + input_h + 10;
         if (y < top) return .none;
         const idx: usize = @intCast(@divTrunc(y - top, row_h));
-        if (idx >= l.n_match + @intFromBool(l.calc_val != null)) return .none;
+        if (idx >= l.nrows()) return .none;
         l.sel = idx;
         return l.activate();
     }
 
     fn activate(l: *Launcher) Result {
         var idx = l.sel;
+        if (l.intent) |it| {
+            if (idx == 0) {
+                _ = intent_mod.command(&l.cmd_buf, it) orelse return .close;
+                return .launch;
+            }
+            idx -= 1;
+        }
         if (l.calc_val) |v| {
             if (idx == 0) {
                 var nb: [48]u8 = undefined;
@@ -204,7 +244,7 @@ pub const Launcher = struct {
         const shift = ev.state & 1 != 0;
         const ctrl = ev.state & 4 != 0;
         const ks = c.xcb_key_symbols_get_keysym(syms, ev.detail, if (shift) 1 else 0);
-        const total = l.n_match + @intFromBool(l.calc_val != null);
+        const total = l.nrows();
 
         switch (ks) {
             0xff1b => return .close, // Escape
@@ -242,7 +282,7 @@ pub const Launcher = struct {
                 } else return .none;
             },
         }
-        l.rebuild();
+        _ = l.rebuild(); // the window exists already: only a resize, which cannot fail here
         return .none;
     }
 };

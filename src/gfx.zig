@@ -197,8 +197,9 @@ pub const Canvas = struct {
             // Columns [cx0, cx1) are fully inside whenever this row is outside the corner bands.
             const cx0 = if (in_corner_rows) x + ri else x0;
             const cx1 = if (in_corner_rows) x + w - ri else x1;
-            const fx0 = std.math.clamp(cx0, x0, x1);
-            const fx1 = std.math.clamp(cx1, x0, x1);
+            // Not std.math.clamp: it asserts lo <= hi, and a rect fully off the canvas makes x1 < x0.
+            const fx0 = @min(@max(cx0, x0), x1);
+            const fx1 = @min(@max(cx1, x0), x1);
             const row = @as(usize, @intCast(yy)) * cv.w;
             if (fx1 > fx0) @memset(cv.buf[row + @as(usize, @intCast(fx0)) ..][0..@intCast(fx1 - fx0)], color);
             if (!in_corner_rows) continue;
@@ -216,6 +217,26 @@ pub const Canvas = struct {
         }
     }
 
+    /// A `size`x`size` image (0x00RRGGBB pixels) with antialiased rounded corners of radius `r`.
+    pub fn image(cv: *Canvas, x: i32, y: i32, px: []const u32, size: i32, r: f32) void {
+        const ri: i32 = @intFromFloat(@ceil(r));
+        var j: i32 = 0;
+        while (j < size) : (j += 1) {
+            const yy = y + j;
+            if (yy < 0 or yy >= cv.h) continue;
+            var i: i32 = 0;
+            while (i < size) : (i += 1) {
+                const xx = x + i;
+                if (xx < 0 or xx >= cv.w) continue;
+                const idx = @as(usize, @intCast(yy)) * cv.w + @as(usize, @intCast(xx));
+                const src = px[@as(usize, @intCast(j * size + i))] & 0xffffff;
+                const corner = (i < ri or i >= size - ri) and (j < ri or j >= size - ri);
+                const cov: f32 = if (corner) roundCoverage(@floatFromInt(i), @floatFromInt(j), @floatFromInt(size), @floatFromInt(size), r) else 1;
+                if (cov > 0) cv.buf[idx] = blend(cv.buf[idx], src, cov);
+            }
+        }
+    }
+
     /// Text with its baseline at `base`; `px` is the em size. Advance is 0.6em (JetBrains Mono).
     /// Falls back to the 8x16 bitmap font when no TTF could be loaded. Returns the end x.
     pub fn textAt(cv: *Canvas, x0: i32, base: i32, s: []const u8, color: u32, px: f32, bold: bool) i32 {
@@ -229,8 +250,8 @@ pub const Canvas = struct {
             var cp: u21 = s[i];
             var n: usize = 1;
             if (s[i] >= 0x80) {
-                n = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-                if (i + n > s.len) n = 1;
+                // Same stepping as cpCount/cpOffset, so widths and clipping agree on bad UTF-8.
+                n = cpLen(s, i);
                 cp = if (n > 1) (std.unicode.utf8Decode(s[i..][0..n]) catch s[i]) else s[i];
             }
             i += n;
@@ -302,9 +323,9 @@ pub const Canvas = struct {
         const dy = y1 - y0;
         const len2 = dx * dx + dy * dy;
         var yy = @max(by0, 0);
-        while (yy <= @min(by1, cv.h - 1)) : (yy += 1) {
+        while (yy <= @min(by1, @as(i32, cv.h) - 1)) : (yy += 1) {
             var xx = @max(bx0, 0);
-            while (xx <= @min(bx1, cv.w - 1)) : (xx += 1) {
+            while (xx <= @min(bx1, @as(i32, cv.w) - 1)) : (xx += 1) {
                 const px = @as(f32, @floatFromInt(xx)) + 0.5 - x0;
                 const py = @as(f32, @floatFromInt(yy)) + 0.5 - y0;
                 const t = if (len2 == 0) 0 else std.math.clamp((px * dx + py * dy) / len2, 0, 1);
@@ -346,7 +367,7 @@ pub const Canvas = struct {
     }
 };
 
-var rect_scratch: [16384]u32 = undefined; // flushRect staging (64 KB)
+var rect_scratch: [262144]u32 = undefined; // flushRect staging (1 MB): the lock's HUD is 720x340
 
 pub const Surface = struct {
     conn: *c.xcb_connection_t,
@@ -357,12 +378,14 @@ pub const Surface = struct {
 
     /// Create an unmapped override-redirect window. `radius` > 0 clips corners with SHAPE.
     pub fn create(conn: *c.xcb_connection_t, screen: *const c.xcb_screen_t, x: i32, y: i32, w: u16, h: u16, radius: u16, event_mask: u32, bg: u32) !Surface {
+        // Memory first: if it fails, no X window or GC has been created yet.
+        const cv = try Canvas.init(w, h);
         const win = c.xcb_generate_id(conn);
         const vals = [_]u32{ bg, 1, event_mask };
         _ = c.xcb_create_window(conn, screen.root_depth, win, screen.root, @intCast(x), @intCast(y), w, h, 0, c.XCB_WINDOW_CLASS_INPUT_OUTPUT, screen.root_visual, c.XCB_CW_BACK_PIXEL | c.XCB_CW_OVERRIDE_REDIRECT | c.XCB_CW_EVENT_MASK, &vals);
         const gc = c.xcb_generate_id(conn);
         _ = c.xcb_create_gc(conn, gc, win, 0, null);
-        var s = Surface{ .conn = conn, .win = win, .gc = gc, .depth = screen.root_depth, .cv = try Canvas.init(w, h) };
+        var s = Surface{ .conn = conn, .win = win, .gc = gc, .depth = screen.root_depth, .cv = cv };
         if (radius > 0) s.applyShape(screen, radius);
         return s;
     }

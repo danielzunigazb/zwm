@@ -21,7 +21,7 @@ pub const Bar = struct {
     last_pill: i32 = -1000,
     bat_path: ?[*:0]const u8 = null,
     bat: Battery = .{},
-    bat_read: i64 = 0, // when `bat` was read (unix s): sysfs is only touched every few seconds
+    bat_read: i64 = 0, // when `bat` was read (unix s): sysfs is read at most every 20 s
 
     pub fn init(conn: *c.xcb_connection_t, screen: *const c.xcb_screen_t) !Bar {
         const gap: u16 = cfg.gap;
@@ -160,10 +160,14 @@ fn findBattery() ?[*:0]const u8 {
     return null;
 }
 
+/// Contents of a regular file (at most buf.len bytes), or empty. Never blocks: a FIFO or device
+/// placed where a file is expected would otherwise stall the whole event loop.
 pub fn readFile(path: [*:0]const u8, buf: []u8) []const u8 {
-    const fd = c.open(path, c.O_RDONLY);
+    const fd = c.open(path, c.O_RDONLY | c.O_NONBLOCK);
     if (fd < 0) return buf[0..0];
     defer _ = c.close(fd);
+    var st: c.struct_stat = undefined;
+    if (c.fstat(fd, &st) != 0 or st.st_mode & c.S_IFMT != c.S_IFREG) return buf[0..0];
     const n = c.read(fd, buf.ptr, buf.len);
     return if (n > 0) buf[0..@intCast(n)] else buf[0..0];
 }

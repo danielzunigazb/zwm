@@ -10,6 +10,7 @@ pub const Status = struct {
     version: u32 = 0,
     vol_pct: i32 = -1,
     muted: bool = false,
+    brightness_pct: i32 = -1,
     net: Net = .none,
     net_name: [32]u8 = undefined,
     net_len: u8 = 0,
@@ -26,6 +27,8 @@ pub const Music = struct {
     title_len: u8 = 0,
     artist: [96]u8 = undefined,
     artist_len: u8 = 0,
+    art_url: [256]u8 = undefined,
+    art_url_len: u8 = 0,
     pos_us: i64 = 0,
     len_us: i64 = 0,
 
@@ -35,12 +38,24 @@ pub const Music = struct {
     pub fn artistSlice(m: *const Music) []const u8 {
         return m.artist[0..m.artist_len];
     }
+    pub fn artUrlSlice(m: *const Music) []const u8 {
+        return m.art_url[0..m.art_url_len];
+    }
 };
 
 pub const max_notifs = 16;
 
+/// Toast time for a notification with no timeout of its own (`expire_timeout` 0 in the spec means
+/// "never expire"; the WM shows it for this long instead). Also used for the WM's own notices.
+pub const toast_default_ms: i32 = 8000;
+const toast_server_ms: i32 = 5000; // expire_timeout < 0: the sender left it to the server
+const toast_max_ms: i32 = 10_000; // a sender may not keep a toast on screen longer than this
+
 pub const Notif = struct {
     id: u32 = 0,
+    /// Bus name of the client that sent it ("zwm" for our own). Only that client may replace or close it.
+    owner: [48]u8 = undefined,
+    owner_len: u8 = 0,
     app: [32]u8 = undefined,
     app_len: u8 = 0,
     summary: [96]u8 = undefined,
@@ -49,6 +64,9 @@ pub const Notif = struct {
     body_len: u8 = 0,
     toast_until: i64 = 0, // monotonic ms; 0 = no toast
 
+    pub fn ownerSlice(n: *const Notif) []const u8 {
+        return n.owner[0..n.owner_len];
+    }
     pub fn appSlice(n: *const Notif) []const u8 {
         return n.app[0..n.app_len];
     }
@@ -61,6 +79,12 @@ pub const Notif = struct {
 };
 
 const latin1_map = "AAAAAAACEEEEIIIIDNOOOOO*OUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";
+
+/// Bidi overrides/isolates and zero-width or format characters: a notification could use them to
+/// make its text read differently from what it says.
+fn isInvisible(cp: u21) bool {
+    return (cp >= 0x200B and cp <= 0x200F) or (cp >= 0x202A and cp <= 0x202E) or (cp >= 0x2066 and cp <= 0x2069) or cp == 0xFEFF;
+}
 
 /// Copy text into `dst`, replacing control characters. With the TTF font loaded the UTF-8 is kept
 /// (cut on a code point boundary); with only the bitmap font it is folded to printable ASCII.
@@ -77,11 +101,13 @@ pub fn sanitize(dst: []u8, src: []const u8) u8 {
             i += 1;
         } else if (utf8) {
             const l = std.unicode.utf8ByteSequenceLength(b) catch 0;
-            const ok = l > 1 and i + l <= src.len and (std.unicode.utf8Decode(src[i..][0..l]) catch null) != null;
-            if (!ok) {
+            const cp = if (l > 1 and i + l <= src.len) (std.unicode.utf8Decode(src[i..][0..l]) catch null) else null;
+            if (cp == null) {
                 dst[n] = '?';
                 n += 1;
                 i += 1;
+            } else if (isInvisible(cp.?)) {
+                i += l; // dropped: it would reorder or hide the text around it
             } else if (n + l <= cap) {
                 @memcpy(dst[n..][0..l], src[i..][0..l]);
                 n += l;
@@ -115,17 +141,25 @@ pub const Store = struct {
     music_dirty: bool = true,
     net_dirty: bool = true,
 
-    pub fn add(s: *Store, app: []const u8, summary: []const u8, body: []const u8, replaces: u32, timeout_ms: i32, now_ms: i64) u32 {
+    /// True when notification `id` is still shown and was sent by `owner` (a bus name).
+    pub fn ownedBy(s: *const Store, id: u32, owner: []const u8) bool {
+        for (s.notifs[0..s.count]) |x| if (x.id == id) return std.mem.eql(u8, x.ownerSlice(), owner);
+        return false;
+    }
+
+    /// `owner` is the sender's bus name. A notification can only be replaced by the client that sent it.
+    pub fn add(s: *Store, app: []const u8, owner: []const u8, summary: []const u8, body: []const u8, replaces: u32, timeout_ms: i32, now_ms: i64) u32 {
         var n = Notif{};
+        n.owner_len = sanitize(&n.owner, owner);
         n.app_len = sanitize(&n.app, app);
         n.summary_len = sanitize(&n.summary, summary);
         n.body_len = sanitize(&n.body, body);
-        const t: i64 = if (timeout_ms < 0) 5000 else if (timeout_ms == 0) 8000 else @min(timeout_ms, 10_000);
+        const t: i64 = if (timeout_ms < 0) toast_server_ms else if (timeout_ms == 0) toast_default_ms else @min(timeout_ms, toast_max_ms);
         n.toast_until = now_ms + t;
 
         var idx: ?usize = null;
         if (replaces != 0) for (s.notifs[0..s.count], 0..) |x, i| {
-            if (x.id == replaces) idx = i;
+            if (x.id == replaces and std.mem.eql(u8, x.ownerSlice(), owner)) idx = i;
         };
         if (idx) |i| {
             n.id = replaces;
@@ -182,16 +216,39 @@ test "sanitize never overruns and keeps valid text" {
 
 test "notification store: replace, dismiss, overflow" {
     var s = Store{};
-    const a = s.add("app", "one", "", 0, 0, 0);
-    const b = s.add("app", "two", "", 0, 0, 0);
+    const a = s.add("app", ":1.7", "one", "", 0, 0, 0);
+    const b = s.add("app", ":1.7", "two", "", 0, 0, 0);
     try std.testing.expect(a != b and s.count == 2);
-    const a2 = s.add("app", "one again", "", a, 0, 0);
+    const a2 = s.add("app", ":1.7", "one again", "", a, 0, 0);
     try std.testing.expectEqual(a, a2); // replaced keeps its id...
     try std.testing.expectEqual(@as(usize, 2), s.count);
     try std.testing.expectEqual(a, s.notifs[0].id); // ...and moves to the front
     s.dismiss(b);
     try std.testing.expectEqual(@as(usize, 1), s.count);
     s.dismiss(9999); // unknown id: no-op
-    for (0..40) |_| _ = s.add("app", "x", "", 0, 0, 0);
+    // Overflow drops the oldest: the first id must be gone once the list is full of newer ones.
+    const oldest = s.add("app", ":1.7", "keep me", "", 0, 0, 0);
+    for (0..40) |_| _ = s.add("app", ":1.7", "x", "", 0, 0, 0);
     try std.testing.expectEqual(@as(usize, max_notifs), s.count);
+    for (s.notifs[0..s.count]) |x| try std.testing.expect(x.id != oldest);
+}
+
+test "notification store: only the sender may replace or close" {
+    var s = Store{};
+    const theirs = s.add("bank", ":1.5", "Your code is 123456", "", 0, 0, 0);
+    // Another client names the same id: it must get a new notification, not overwrite this one.
+    const forged = s.add("bank", ":1.9", "Send money to", "", theirs, 0, 0);
+    try std.testing.expect(forged != theirs);
+    try std.testing.expect(s.ownedBy(theirs, ":1.5"));
+    try std.testing.expect(!s.ownedBy(theirs, ":1.9"));
+    try std.testing.expectEqualStrings("Your code is 123456", s.notifs[1].summarySlice());
+}
+
+test "sanitize drops bidi overrides and zero-width characters" {
+    // Without the TTF font, sanitize folds to ASCII instead of keeping UTF-8: nothing to check there.
+    if (!gfx.hasTtf()) return error.SkipZigTest;
+    var buf: [64]u8 = undefined;
+    // U+202E (right-to-left override) and U+200B (zero-width space) around plain text.
+    const n = sanitize(&buf, "a\u{202E}b\u{200B}c");
+    try std.testing.expectEqualStrings("abc", buf[0..n]);
 }

@@ -1,4 +1,4 @@
-// Side panel (calendar, music, notifications), desktop widget and notification toasts.
+// Side panel (calendar, music with cover art, notifications), desktop widget and notification toasts.
 // Everything is a gfx.Surface drawn from the shared store.
 
 const std = @import("std");
@@ -8,6 +8,7 @@ const gfx = @import("gfx.zig");
 const icons = @import("icons.zig");
 const anim = @import("anim.zig");
 const store = @import("store.zig");
+const sys = @import("sys.zig");
 
 const Store = store.Store;
 const glyph_w = gfx.glyph_w;
@@ -65,6 +66,13 @@ const Hit = struct { x: i32, y: i32, w: i32, h: i32, what: Click };
 pub const panel_w: u16 = 320;
 const pad = 14;
 const card_gap = 12;
+const music_card_h = 12 + @as(i32, sys.art_px) + 12 + 4 + 8 + 14 + 12;
+
+/// `m:ss` for a position in microseconds.
+fn clock(buf: []u8, us: i64) []const u8 {
+    const sec: u64 = @intCast(@max(@divFloor(us, 1_000_000), 0));
+    return std.fmt.bufPrint(buf, "{d}:{d:0>2}", .{ sec / 60, sec % 60 }) catch "";
+}
 
 pub const Panel = struct {
     conn: *c.xcb_connection_t,
@@ -86,7 +94,7 @@ pub const Panel = struct {
         return @floatFromInt(@as(i32, p.screen.width_in_pixels) - cfg.gap - panel_w);
     }
 
-    pub fn toggle(p: *Panel, st: *const Store) void {
+    pub fn toggle(p: *Panel, st: *const Store, art: *const sys.Art) void {
         if (p.surf != null) {
             p.closing = !p.closing; // re-toggling mid-slide just reverses it
             return;
@@ -101,7 +109,7 @@ pub const Panel = struct {
         p.x = @floatFromInt(x);
         p.y = y;
         p.closing = false;
-        p.draw(st, true);
+        p.draw(st, art, true);
     }
 
     pub fn step(p: *Panel, dt: f32) bool {
@@ -143,11 +151,11 @@ pub const Panel = struct {
         }
     }
 
-    pub fn draw(p: *Panel, st: *const Store, force: bool) void {
+    pub fn draw(p: *Panel, st: *const Store, art: *const sys.Art, force: bool) void {
         const s = &(p.surf orelse return);
         const tm = localNow();
         const m = &st.music;
-        const sig = std.hash.Wyhash.hash(0, std.mem.asBytes(&[_]i64{ st.version, tm.tm_min, tm.tm_hour, tm.tm_mday, @intFromBool(m.playing), @divFloor(m.pos_us, 1_000_000), @intFromBool(m.have) }));
+        const sig = std.hash.Wyhash.hash(0, std.mem.asBytes(&[_]i64{ st.version, tm.tm_min, tm.tm_hour, tm.tm_mday, @intFromBool(m.playing), @divFloor(m.pos_us, 1_000_000), @intFromBool(m.have), @intFromBool(art.have) }));
         if (!force and sig == p.last_sig) return;
         p.last_sig = sig;
         p.n_hits = 0;
@@ -204,31 +212,52 @@ pub const Panel = struct {
             y += card_h + card_gap;
         }
 
-        // Music card.
+        // Music card: cover and track on top, transport buttons beside the cover, progress below.
         if (m.have) {
-            const card_h = pad + 17 + 3 + 16 + 12 + 4 + 12 + 22 + pad;
+            const card_h = music_card_h;
             cv.roundRect(pad, y, inner_w, card_h, 10, cfg.desktop_bg);
-            const maxc: usize = @intCast(@divTrunc(inner_w - 2 * pad, 7));
-            _ = cv.textFit13(pad + pad, y + pad + 13, m.titleSlice(), maxc, cfg.fg_bright, true);
-            _ = cv.textFit13(pad + pad, y + pad + 17 + 3 + 12, m.artistSlice(), maxc + 1, cfg.fg_dim, false);
-
-            const by = y + pad + 17 + 3 + 16 + 12;
-            const bw = inner_w - 2 * pad;
-            cv.roundRect(pad + pad, by, bw, 4, 2, 0x4c566a);
-            if (m.len_us > 0) {
-                const frac = std.math.clamp(@as(f32, @floatFromInt(m.pos_us)) / @as(f32, @floatFromInt(m.len_us)), 0, 1);
-                const fw: i32 = @intFromFloat(@as(f32, @floatFromInt(bw)) * frac);
-                if (fw > 0) cv.roundRect(pad + pad, by, fw, 4, 2, cfg.accent);
+            const x0 = pad + 12;
+            const cw = inner_w - 24;
+            const ay = y + 12;
+            const art_s: i32 = @intCast(sys.art_px);
+            if (art.have) {
+                cv.image(x0, ay, &art.pixels, art_s, 8);
+            } else {
+                cv.roundRect(x0, ay, art_s, art_s, 8, 0x333640);
+                icons.draw(cv, .note, @floatFromInt(x0 + @divTrunc(art_s - 28, 2)), @floatFromInt(ay + @divTrunc(art_s - 28, 2)), 28, cfg.fg_dim);
             }
 
-            const cy = by + 4 + 12;
-            const mid = @divTrunc(panel_w, 2);
-            icons.draw(cv, .prev, @floatFromInt(mid - 42 - 9), @floatFromInt(cy + 2), 18, cfg.fg);
-            icons.draw(cv, if (m.playing) .pause else .play, @floatFromInt(mid - 11), @floatFromInt(cy), 22, cfg.accent);
-            icons.draw(cv, .next, @floatFromInt(mid + 42 - 9), @floatFromInt(cy + 2), 18, cfg.fg);
-            p.addHit(mid - 42 - 20, cy - 4, 40, 30, .prev);
-            p.addHit(mid - 20, cy - 4, 40, 30, .play);
-            p.addHit(mid + 42 - 20, cy - 4, 40, 30, .next);
+            const ix = x0 + art_s + 12;
+            const iw = x0 + cw - ix;
+            const maxc: usize = @intCast(@divTrunc(iw, 8));
+            _ = cv.textFit13(ix, ay + 13, m.titleSlice(), maxc, cfg.fg_bright, true);
+            _ = cv.textFit13(ix, ay + 13 + 18, m.artistSlice(), maxc, cfg.fg_dim, false);
+
+            const cy = ay + art_s - 20; // vertical centre of the buttons, level with the cover's bottom edge
+            const third = @divTrunc(iw, 3);
+            const bx = [3]i32{ ix + @divTrunc(third, 2), ix + third + @divTrunc(third, 2), ix + 2 * third + @divTrunc(third, 2) };
+            icons.draw(cv, .prev, @floatFromInt(bx[0] - 9), @floatFromInt(cy - 9), 18, cfg.fg);
+            cv.roundRect(bx[1] - 18, cy - 18, 36, 36, 18, cfg.accent);
+            icons.draw(cv, if (m.playing) .pause else .play, @floatFromInt(bx[1] - 9), @floatFromInt(cy - 9), 18, cfg.bar_bg);
+            icons.draw(cv, .next, @floatFromInt(bx[2] - 9), @floatFromInt(cy - 9), 18, cfg.fg);
+            p.addHit(bx[0] - 20, cy - 18, 40, 36, .prev);
+            p.addHit(bx[1] - 20, cy - 18, 40, 36, .play);
+            p.addHit(bx[2] - 20, cy - 18, 40, 36, .next);
+
+            const by = ay + art_s + 12;
+            cv.roundRect(x0, by, cw, 4, 2, 0x4c566a);
+            if (m.len_us > 0) {
+                const frac = std.math.clamp(@as(f32, @floatFromInt(m.pos_us)) / @as(f32, @floatFromInt(m.len_us)), 0, 1);
+                const fw: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(cw)) * frac));
+                if (fw > 0) cv.roundRect(x0, by, @max(fw, 4), 4, 2, cfg.accent);
+            }
+            var eb: [16]u8 = undefined;
+            _ = cv.textAt(x0, by + 4 + 4 + 11, clock(&eb, m.pos_us), cfg.fg_dim, 11, false);
+            if (m.len_us > 0) {
+                var lb: [16]u8 = undefined;
+                const total = clock(&lb, m.len_us);
+                _ = cv.textAt(x0 + cw - @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(total.len)) * 6.6))), by + 4 + 4 + 11, total, cfg.fg_dim, 11, false);
+            }
             y += card_h + card_gap;
         }
 

@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""zwm-music: control Spotify on whatever device is playing (phone, speaker, this PC) via the
+Spotify Web API / Connect. Called by the zwm launcher ("pon ...", "pausa", ...).
+
+    zwm-music login CLIENT_ID    one-time authorization (opens the browser)
+    zwm-music play 'query'       search a track and play it
+    zwm-music album 'query'      search an album and play it
+    zwm-music pause | resume | next | prev
+    zwm-music devices            list the devices Spotify can see
+
+Results are reported as desktop notifications (zwm is the notification server); on a terminal they
+are printed too. Standard library only. Needs Spotify Premium for playback control.
+"""
+
+import base64
+import hashlib
+import http.server
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+
+API = "https://api.spotify.com/v1"
+ACCOUNTS = "https://accounts.spotify.com"
+PORT = 8888
+REDIRECT = f"http://127.0.0.1:{PORT}/callback"  # Spotify only accepts loopback IPs, not "localhost"
+SCOPES = "user-modify-playback-state user-read-playback-state"
+CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "zwm", "spotify.json")
+
+
+class Fail(Exception):
+    """A problem worth telling the user about, in one line."""
+
+
+def notify(title, body=""):
+    if sys.stderr.isatty():
+        print(title + (" - " + body if body else ""), file=sys.stderr)
+    try:
+        subprocess.run(["notify-send", "-a", "zwm-music", "-t", "4000", title, body], timeout=3, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+# ---- config and tokens ----
+
+def load():
+    try:
+        with open(CONF) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save(conf):
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    tmp = CONF + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # tokens: owner only
+    with os.fdopen(fd, "w") as f:
+        json.dump(conf, f, indent=1)
+    os.replace(tmp, CONF)
+
+
+def post_form(url, data):
+    req = urllib.request.Request(url, urllib.parse.urlencode(data).encode(), {"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise Fail("Spotify rechazo la autorizacion; corre «zwm-music login» otra vez") from e
+
+
+def access_token(conf, force=False):
+    if not conf.get("refresh_token") or not conf.get("client_id"):
+        raise Fail("Falta autorizar Spotify: zwm-music login CLIENT_ID")
+    if not force and conf.get("access_token") and conf.get("expires_at", 0) > time.time() + 30:
+        return conf["access_token"]
+    tok = post_form(ACCOUNTS + "/api/token", {"grant_type": "refresh_token", "refresh_token": conf["refresh_token"], "client_id": conf["client_id"]})
+    conf["access_token"] = tok["access_token"]
+    conf["expires_at"] = time.time() + tok.get("expires_in", 3600)
+    conf["refresh_token"] = tok.get("refresh_token", conf["refresh_token"])
+    save(conf)
+    return conf["access_token"]
+
+
+def login(client_id):
+    conf = load()
+    conf["client_id"] = client_id or conf.get("client_id")
+    if not conf["client_id"]:
+        raise Fail("Uso: zwm-music login CLIENT_ID  (el de tu app en developer.spotify.com)")
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    url = ACCOUNTS + "/authorize?" + urllib.parse.urlencode({
+        "client_id": conf["client_id"], "response_type": "code", "redirect_uri": REDIRECT,
+        "scope": SCOPES, "state": state, "code_challenge_method": "S256", "code_challenge": challenge,
+    })
+    got = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            got.update({k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("Listo, ya puedes cerrar esta pestana.".encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    server.timeout = 180
+    print("Abriendo el navegador. Si no se abre, visita:\n" + url, file=sys.stderr)
+    webbrowser.open(url)
+    server.handle_request()
+    server.server_close()
+    if got.get("state") != state or "code" not in got:
+        raise Fail("Autorizacion cancelada o expirada")
+    tok = post_form(ACCOUNTS + "/api/token", {
+        "grant_type": "authorization_code", "code": got["code"], "redirect_uri": REDIRECT,
+        "client_id": conf["client_id"], "code_verifier": verifier,
+    })
+    conf.update(access_token=tok["access_token"], refresh_token=tok["refresh_token"], expires_at=time.time() + tok.get("expires_in", 3600))
+    save(conf)
+    notify("Spotify conectado", "Ya puedes usar «pon ...» en el lanzador")
+
+
+# ---- API ----
+
+def call(conf, method, path, params=None, body=None, retry=True):
+    """-> (status, json or None). 401 refreshes the token once; other HTTP errors are returned."""
+    url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data, {"Authorization": "Bearer " + access_token(conf), "Content-Type": "application/json"}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and retry:
+            access_token(conf, force=True)
+            return call(conf, method, path, params, body, retry=False)
+        try:
+            return e.code, json.loads(e.read() or b"null")
+        except ValueError:
+            return e.code, None
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise Fail("Sin conexion con Spotify") from e
+
+
+def pick_device(conf):
+    """The device to drive: the active one, else a phone, else any that is not restricted."""
+    status, data = call(conf, "GET", "/me/player/devices")
+    devices = [d for d in (data or {}).get("devices", []) if not d.get("is_restricted")] if status == 200 else []
+    if not devices:
+        raise Fail("Abre Spotify en algun dispositivo (movil, PC...)")
+    for want in (lambda d: d.get("is_active"), lambda d: d.get("type") == "Smartphone", lambda d: True):
+        for d in devices:
+            if want(d):
+                return d
+    return devices[0]
+
+
+def explain(status, data):
+    reason = ((data or {}).get("error") or {}).get("reason", "")
+    if status == 403 or reason == "PREMIUM_REQUIRED":
+        return "Spotify exige Premium para controlar la reproduccion"
+    if status == 404 or reason == "NO_ACTIVE_DEVICE":
+        return "Spotify no encuentra un dispositivo activo"
+    if status == 429:
+        return "Spotify pide ir mas despacio; reintenta en unos segundos"
+    return f"Spotify respondio {status}"
+
+
+def search(conf, kind, query):
+    status, data = call(conf, "GET", "/search", {"q": query, "type": kind, "limit": 5})
+    if status != 200:
+        raise Fail(explain(status, data))
+    items = (data or {}).get(kind + "s", {}).get("items", [])
+    items = [i for i in items if i]
+    if not items:
+        raise Fail(f"No encontre «{query}»")
+    return items[0]
+
+
+def names(item):
+    return ", ".join(a["name"] for a in item.get("artists", [])[:2])
+
+
+def now_playing(item, dev):
+    """Title on top, "artist · device" below: toasts cut long titles, so keep them on their own."""
+    notify(item["name"], " · ".join(x for x in (names(item), "en " + dev["name"]) if x))
+
+
+def play(conf, kind, query):
+    # "x de y" reads naturally but "de" is noise to the search.
+    query = " ".join(query.replace(" de ", " ").split())
+    item = search(conf, kind, query)
+    dev = pick_device(conf)
+    body = {"uris": [item["uri"]]} if kind == "track" else {"context_uri": item["uri"]}
+    status, data = call(conf, "PUT", "/me/player/play", {"device_id": dev["id"]}, body)
+    if status not in (200, 202, 204):
+        raise Fail(explain(status, data))
+    now_playing(item, dev)
+
+
+def control(conf, verb):
+    dev = pick_device(conf)
+    pid = {"device_id": dev["id"]}
+    method, path, body = {
+        "pause": ("PUT", "/me/player/pause", None),
+        "resume": ("PUT", "/me/player/play", {}),
+        "next": ("POST", "/me/player/next", None),
+        "prev": ("POST", "/me/player/previous", None),
+    }[verb]
+    status, data = call(conf, method, path, pid, body)
+    if status not in (200, 202, 204):
+        raise Fail(explain(status, data))
+    # Skipping is only worth a toast with the new title; the rest is visible by ear.
+    if verb in ("next", "prev"):
+        time.sleep(0.4)
+        status, data = call(conf, "GET", "/me/player/currently-playing")
+        item = (data or {}).get("item") if status == 200 else None
+        if item:
+            now_playing(item, dev)
+
+
+def list_devices(conf):
+    status, data = call(conf, "GET", "/me/player/devices")
+    if status != 200:
+        raise Fail(explain(status, data))
+    for d in (data or {}).get("devices", []):
+        print(("* " if d.get("is_active") else "  ") + f"{d['name']} ({d['type']})")
+
+
+def main(argv):
+    if not argv:
+        print(__doc__, file=sys.stderr)
+        return 2
+    verb, arg = argv[0], " ".join(argv[1:]).strip()
+    try:
+        if verb == "login":
+            login(arg)
+            return 0
+        conf = load()
+        if verb in ("play", "album"):
+            if not arg:
+                raise Fail("Que pongo?")
+            play(conf, "track" if verb == "play" else "album", arg)
+        elif verb in ("pause", "resume", "next", "prev"):
+            control(conf, verb)
+        elif verb == "devices":
+            list_devices(conf)
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+    except Fail as e:
+        notify("Musica", str(e))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

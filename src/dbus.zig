@@ -204,6 +204,11 @@ pub const Dbus = struct {
                     if (c.sd_bus_message_read(r, "t", &v) > 0) m.len_us = @intCast(@min(v, std.math.maxInt(i64)));
                 }
                 _ = c.sd_bus_message_exit_container(r);
+            } else if (std.mem.eql(u8, k, "mpris:artUrl") and std.mem.eql(u8, sig, "s")) {
+                _ = c.sd_bus_message_enter_container(r, 'v', "s");
+                var s: [*c]const u8 = null;
+                if (c.sd_bus_message_read(r, "s", &s) > 0) m.art_url_len = store_mod.sanitize(&m.art_url, std.mem.span(s));
+                _ = c.sd_bus_message_exit_container(r);
             } else {
                 _ = c.sd_bus_message_skip(r, "v");
             }
@@ -295,16 +300,30 @@ fn onMethod(m: ?*c.sd_bus_message, ud: ?*anyopaque, _: [*c]c.sd_bus_error) callc
         _ = c.sd_bus_message_skip(m, "asa{sv}");
         var timeout: c_int = -1;
         _ = c.sd_bus_message_read(m, "i", &timeout);
-        const id = d.store.add(std.mem.span(app), std.mem.span(summary), std.mem.span(body), rid, timeout, panel.nowMs());
+        const sender: [*c]const u8 = c.sd_bus_message_get_sender(m);
+        const owner: []const u8 = if (sender != null) std.mem.span(sender) else "";
+        const id = d.store.add(std.mem.span(app), owner, std.mem.span(summary), std.mem.span(body), rid, timeout, panel.nowMs());
         _ = c.sd_bus_reply_method_return(m, "u", @as(c_uint, id));
     } else if (std.mem.eql(u8, member, "GetCapabilities")) {
-        _ = c.sd_bus_reply_method_return(m, "as", @as(c_uint, 1), cap_body);
+        // "as" is an array: build it with a container. Passing the count as a varargs integer does not
+        // work (sd-bus reads it as a pointer), and produced a corrupt reply.
+        var reply: ?*c.sd_bus_message = null;
+        if (c.sd_bus_message_new_method_return(m, &reply) < 0) return 0;
+        defer _ = c.sd_bus_message_unref(reply);
+        const bus = c.sd_bus_message_get_bus(m);
+        if (c.sd_bus_message_open_container(reply, 'a', "s") < 0 or
+            c.sd_bus_message_append(reply, "s", cap_body) < 0 or
+            c.sd_bus_message_close_container(reply) < 0) return 0;
+        _ = c.sd_bus_send(bus, reply, null);
     } else if (std.mem.eql(u8, member, "GetServerInformation")) {
         _ = c.sd_bus_reply_method_return(m, "ssss", info_name, info_vendor, info_version, info_spec);
     } else if (std.mem.eql(u8, member, "CloseNotification")) {
         var id: c_uint = 0;
         _ = c.sd_bus_message_read(m, "u", &id);
-        d.store.dismiss(id);
+        // Only the client that sent a notification may close it.
+        const sender: [*c]const u8 = c.sd_bus_message_get_sender(m);
+        const owner: []const u8 = if (sender != null) std.mem.span(sender) else "";
+        if (d.store.ownedBy(id, owner)) d.store.dismiss(id);
         _ = c.sd_bus_reply_method_return(m, null);
     } else return 0;
     return 1;

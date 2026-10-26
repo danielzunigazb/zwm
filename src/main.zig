@@ -8,6 +8,7 @@ const store_mod = @import("store.zig");
 const dbus_mod = @import("dbus.zig");
 const sys = @import("sys.zig");
 const Launcher = @import("launcher.zig").Launcher;
+const Lock = @import("lock.zig").Lock;
 const anim = @import("anim.zig");
 
 const Tree = tree_mod.Tree;
@@ -29,6 +30,7 @@ const WM = struct {
     panel: panel_mod.Panel,
     toasts: panel_mod.Toasts,
     launcher: Launcher,
+    lock: Lock,
     syms: ?*c.xcb_key_symbols_t = null,
     store: store_mod.Store = .{},
     dbus: dbus_mod.Dbus = .{},
@@ -42,12 +44,15 @@ const WM = struct {
     wm_protocols: c.xcb_atom_t,
     wm_delete: c.xcb_atom_t,
     wm_type: c.xcb_atom_t, // _NET_WM_WINDOW_TYPE
+    wm_desktop: c.xcb_atom_t, // _NET_WM_DESKTOP: which workspace a window belongs to
     float_types: [8]c.xcb_atom_t, // types that float instead of tiling
     running: bool = true,
     ghosts: [Tree.max_leaves]Ghost = undefined,
     n_ghosts: usize = 0,
     animating: bool = false,
     vol: sys.Volume = .{},
+    art: sys.Art = .{},
+    brightness: sys.Brightness = .{},
     apps_warm: bool = false,
     last_ns: i64 = 0,
 
@@ -59,11 +64,13 @@ const WM = struct {
     }
 
     fn grabKeys(wm: *WM) void {
-        const syms = c.xcb_key_symbols_alloc(wm.conn); // kept for the launcher's key translation
-        wm.syms = syms;
+        // One keysym table for the life of the WM; it is refreshed on MappingNotify (onMapping).
+        if (wm.syms == null) wm.syms = c.xcb_key_symbols_alloc(wm.conn);
+        const syms = wm.syms orelse return;
         // Also grab with NumLock (mod2) / CapsLock (lock) so they don't break binds.
         const extra = [_]u16{ 0, 2, 16, 18 };
         for (cfg.binds, 0..) |b, i| {
+            wm.keycodes[i] = 0; // a bind whose key left the keymap stops matching
             const kc = c.xcb_key_symbols_get_keycode(syms, b.keysym) orelse continue;
             defer std.c.free(kc);
             if (kc[0] == 0) continue; // NoSymbol
@@ -73,6 +80,30 @@ const WM = struct {
                 _ = c.xcb_grab_key(wm.conn, 1, wm.root, m | e, kc[0], c.XCB_GRAB_MODE_ASYNC, c.XCB_GRAB_MODE_ASYNC);
             }
         }
+    }
+
+    /// Keyboard layout changed (MappingNotify): refresh the keysyms and move every grab to the new keycodes.
+    fn onMapping(wm: *WM, e: *c.xcb_mapping_notify_event_t) void {
+        if (e.request != c.XCB_MAPPING_KEYBOARD) return;
+        if (wm.syms) |syms| _ = c.xcb_refresh_keyboard_mapping(syms, e);
+        _ = c.xcb_ungrab_key(wm.conn, c.XCB_GRAB_ANY, wm.root, c.XCB_MOD_MASK_ANY);
+        wm.grabKeys();
+        _ = c.xcb_flush(wm.conn);
+    }
+
+    /// Window's workspace, stored in its _NET_WM_DESKTOP so it survives a WM restart.
+    fn stamp(wm: *WM, win: u32, ws: usize) void {
+        const v = [_]u32{@intCast(ws)};
+        _ = c.xcb_change_property(wm.conn, c.XCB_PROP_MODE_REPLACE, win, wm.wm_desktop, c.XCB_ATOM_CARDINAL, 32, 1, &v);
+    }
+
+    fn desktopOf(wm: *WM, win: u32) ?usize {
+        const ck = c.xcb_get_property(wm.conn, 0, win, wm.wm_desktop, c.XCB_ATOM_CARDINAL, 0, 1);
+        const r = c.xcb_get_property_reply(wm.conn, ck, null) orelse return null;
+        defer std.c.free(r);
+        if (c.xcb_get_property_value_length(r) < 4) return null;
+        const v: *const u32 = @ptrCast(@alignCast(c.xcb_get_property_value(r)));
+        return if (v.* < cfg.workspaces) v.* else null;
     }
 
     fn setBorder(wm: *WM, win: u32, color: u32) void {
@@ -172,14 +203,12 @@ const WM = struct {
         // shell redraws its prompt on each one (animating size filled terminals with prompts).
         node.cw = @floatFromInt(node.tw);
         node.ch = @floatFromInt(node.th);
-        const m3 = false;
-        const m4 = false;
         const nx = anim.round(node.cx);
         const ny = anim.round(node.cy);
         const nw: u32 = @intCast(@max(1, anim.round(node.cw)));
         const nh: u32 = @intCast(@max(1, anim.round(node.ch)));
         if (nx != node.sx or ny != node.sy or nw != node.sw or nh != node.sh) wm.configure(node, false);
-        return m1 or m2 or m3 or m4;
+        return m1 or m2;
     }
 
     fn stepGhosts(wm: *WM, dt: f32) bool {
@@ -240,6 +269,7 @@ const WM = struct {
         moving = wm.panel.step(dt) or moving;
         moving = wm.toasts.step(dt) or moving;
         moving = wm.launcher.step(dt) or moving;
+        moving = wm.lock.step(dt) or moving;
         return moving;
     }
 
@@ -289,7 +319,12 @@ const WM = struct {
         }
         const mask: u32 = c.XCB_EVENT_MASK_ENTER_WINDOW;
         _ = c.xcb_change_window_attributes(wm.conn, win, c.XCB_CW_EVENT_MASK, &mask);
-        const leaf = wm.tree.insert(wm.focus, win, wm.area) catch return;
+        const leaf = wm.tree.insert(wm.focus, win, wm.area) catch {
+            // Out of memory for the tree: show it floating rather than leave it unmapped forever.
+            wm.mapFloating(win);
+            return;
+        };
+        wm.stamp(win, wm.cur);
         // Start the new window on top of the one it splits, then let both settle into their halves.
         if (leaf.parent) |p| if (p.a) |sib| if (sib.placed and sib.isLeaf()) {
             leaf.cx = sib.cx;
@@ -367,6 +402,8 @@ const WM = struct {
         wm.cur = n;
         wm.tree = wm.saved[n].tree;
         const f = wm.saved[n].focus;
+        // The window leaving the screen loses focus; its border must say so for when it comes back.
+        if (wm.focus) |old| if (old.isLeaf()) wm.setBorder(old.win, cfg.border_normal);
         wm.focus = null;
         // Incoming windows are configured one screen away, then mapped, then slide in.
         wm.layout(wm.tree.root, wm.area);
@@ -380,11 +417,13 @@ const WM = struct {
         if (n == wm.cur) return;
         const leaf = wm.focus orelse return;
         const win = leaf.win;
+        wm.setBorder(win, cfg.border_normal);
         wm.focus = null;
         const next = wm.tree.remove(leaf);
         const dst = &wm.saved[n];
         const nl = dst.tree.insert(dst.focus, win, wm.area) catch return;
         nl.skip_unmap = 1;
+        wm.stamp(win, n);
         _ = c.xcb_unmap_window(wm.conn, win);
         if (dst.focus == null) dst.focus = nl;
         wm.relayout();
@@ -427,10 +466,14 @@ const WM = struct {
         var len: usize = 0;
         Tree.collect(wm.tree.root, wm.area, &list, &len);
 
+        // The focused leaf is missing from `list` when the tree has more leaves than max_leaves.
         var cr: Rect = undefined;
+        var found = false;
         for (list[0..len]) |e| if (e.node == cur) {
             cr = e.rect;
+            found = true;
         };
+        if (!found) return null;
 
         const horiz = dir == .left or dir == .right;
         var best: ?*Node = null;
@@ -482,13 +525,18 @@ const WM = struct {
     fn resizeDir(wm: *WM, dir: cfg.Dir4) void {
         const cur = wm.focus orelse return;
         const horiz = dir == .left or dir == .right;
-        const anc = Tree.ancestor(cur, if (horiz) .horizontal else .vertical) orelse return;
-        const sign: f32 = if (dir == .right or dir == .down) 1 else -1;
-        anc.split.ratio = std.math.clamp(anc.split.ratio + sign * cfg.resize_step, 0.1, 0.9);
+        // Growing toward right/down means the focused leaf is in the first child (its far edge is
+        // the divider); toward left/up it is in the second child.
+        const forward = dir == .right or dir == .down;
+        const split = Tree.ancestorOn(cur, if (horiz) .horizontal else .vertical, forward) orelse return;
+        const sign: f32 = if (forward) 1 else -1;
+        split.ratio = std.math.clamp(split.ratio + sign * cfg.resize_step, 0.1, 0.9);
         wm.relayout();
     }
 
     /// Take over windows that are already on screen (after a WM restart) instead of orphaning them.
+    /// Take over the windows a previous WM instance left behind. Each one goes back to its workspace
+    /// (_NET_WM_DESKTOP). Hidden windows of other workspaces stay unmapped in that workspace's tree.
     fn adopt(wm: *WM) void {
         const r = c.xcb_query_tree_reply(wm.conn, c.xcb_query_tree(wm.conn, wm.root), null) orelse return;
         defer std.c.free(r);
@@ -497,13 +545,38 @@ const WM = struct {
         for (kids) |w| {
             const a = c.xcb_get_window_attributes_reply(wm.conn, c.xcb_get_window_attributes(wm.conn, w), null) orelse continue;
             defer std.c.free(a);
-            if (a.*.override_redirect != 0 or a.*.map_state != c.XCB_MAP_STATE_VIEWABLE) continue;
-            wm.manage(w);
+            if (a.*.override_redirect != 0) continue;
+            const viewable = a.*.map_state == c.XCB_MAP_STATE_VIEWABLE;
+            const ws = wm.desktopOf(w);
+            // Hidden and never stamped: not one of ours (a helper or a closed dialog). Leave it alone.
+            if (!viewable and ws == null) continue;
+            const target = ws orelse 0;
+            if (target == wm.cur) wm.manage(w) else wm.adoptHidden(w, target, viewable);
         }
     }
 
+    /// A window of a workspace we are not on: keep it unmapped in that workspace's tree. Switching
+    /// there maps it, as for any window that was hidden by a switch.
+    fn adoptHidden(wm: *WM, win: u32, ws: usize, viewable: bool) void {
+        const dst = &wm.saved[ws];
+        const leaf = dst.tree.insert(dst.focus, win, wm.area) catch return;
+        const mask: u32 = c.XCB_EVENT_MASK_ENTER_WINDOW;
+        _ = c.xcb_change_window_attributes(wm.conn, win, c.XCB_CW_EVENT_MASK, &mask);
+        if (viewable) {
+            leaf.skip_unmap = 1; // this unmap is ours: the UnmapNotify must not drop the window
+            _ = c.xcb_unmap_window(wm.conn, win);
+        }
+        if (dst.focus == null) dst.focus = leaf;
+    }
+
     fn onKey(wm: *WM, ev: *c.xcb_key_press_event_t) void {
-        if (wm.launcher.visible()) { // keyboard is grabbed: everything goes to the launcher
+        if (wm.lock.visible()) { // locked: no binds, nothing but the password reaches the WM
+            if (wm.syms) |syms| if (wm.lock.onKey(ev, syms)) wm.unlocked();
+            return;
+        }
+        // Keyboard is grabbed by the launcher: typing goes to it, but Super combinations are binds
+        // (Super+L must lock even with the launcher open).
+        if (wm.launcher.visible() and ev.state & cfg.mod_mask == 0) {
             wm.launcherResult(wm.launcher.onKey(ev));
             return;
         }
@@ -520,15 +593,17 @@ const WM = struct {
                 .resize => wm.resizeDir(b.dir),
                 .workspace => wm.switchTo(b.n),
                 .send_to => wm.sendTo(b.n),
-                .toggle_panel => wm.panel.toggle(&wm.store),
+                .toggle_panel => wm.panel.toggle(&wm.store, &wm.art),
                 .spawn => sys.spawn(b.cmd),
                 .launcher => if (wm.syms) |syms| {
-                    _ = wm.launcher.open(syms);
+                    if (!wm.launcher.open(syms)) wm.notify("No se pudo abrir el lanzador", "Otra aplicación tiene el teclado.");
                 },
+                .lock => wm.lockScreen(),
                 .music_toggle => wm.dbus.control("PlayPause"),
                 .music_next => wm.dbus.control("Next"),
                 .music_prev => wm.dbus.control("Previous"),
                 .volume => wm.vol.request(b.cmd),
+                .brightness => sys.spawn(b.cmd),
             }
             return;
         }
@@ -539,7 +614,10 @@ const WM = struct {
             wm.relayout();
             return;
         }
-        // Unmanaged window: let it have what it asks for.
+        // Unmanaged window: let it have what it asks for, except where it stacks: while the lock is up,
+        // nothing may be raised above it.
+        var mask = ev.value_mask;
+        if (wm.lock.visible()) mask &= ~@as(u16, c.XCB_CONFIG_WINDOW_SIBLING | c.XCB_CONFIG_WINDOW_STACK_MODE);
         var vals: [7]u32 = undefined;
         var n: usize = 0;
         const fields = .{
@@ -552,12 +630,12 @@ const WM = struct {
             .{ c.XCB_CONFIG_WINDOW_STACK_MODE, @as(u32, ev.stack_mode) },
         };
         inline for (fields) |f| {
-            if (ev.value_mask & f[0] != 0) {
+            if (mask & f[0] != 0) {
                 vals[n] = f[1];
                 n += 1;
             }
         }
-        _ = c.xcb_configure_window(wm.conn, ev.window, ev.value_mask, &vals);
+        _ = c.xcb_configure_window(wm.conn, ev.window, mask, &vals);
         _ = c.xcb_flush(wm.conn);
     }
 
@@ -568,6 +646,7 @@ const WM = struct {
                 wm.panel.raise();
                 wm.toasts.raise();
                 wm.launcher.raise();
+                wm.lock.raise(); // a new window must never end up above the lock
             },
             c.XCB_UNMAP_NOTIFY => wm.onUnmap(@as(*c.xcb_unmap_notify_event_t, @ptrCast(@alignCast(ev))).window),
             c.XCB_DESTROY_NOTIFY => {
@@ -576,6 +655,13 @@ const WM = struct {
                 if (wm.focus) |f| if (f.isLeaf()) wm.setFocus(f);
             },
             c.XCB_CONFIGURE_REQUEST => wm.onConfigureRequest(@ptrCast(@alignCast(ev))),
+            // Override-redirect windows (menus, popups) map without a MapRequest: put the lock back on
+            // top when one shows up. The lock's own MapNotify is skipped, so this cannot loop.
+            c.XCB_MAP_NOTIFY => {
+                const e: *c.xcb_map_notify_event_t = @ptrCast(@alignCast(ev));
+                if (wm.lock.visible() and e.window != wm.lock.winId()) wm.lock.raise();
+            },
+            c.XCB_MAPPING_NOTIFY => wm.onMapping(@ptrCast(@alignCast(ev))),
             c.XCB_KEY_PRESS => wm.onKey(@ptrCast(@alignCast(ev))),
             c.XCB_EXPOSE => {
                 const e: *c.xcb_expose_event_t = @ptrCast(@alignCast(ev));
@@ -585,8 +671,9 @@ const WM = struct {
                 wm.panel.expose(e.window);
                 wm.toasts.expose(e.window);
                 wm.launcher.expose(e.window);
+                wm.lock.expose(e.window);
             },
-            c.XCB_BUTTON_PRESS => wm.onClick(@ptrCast(@alignCast(ev))),
+            c.XCB_BUTTON_PRESS => wm.onButtonPress(@ptrCast(@alignCast(ev))),
             c.XCB_ENTER_NOTIFY => {
                 const e: *c.xcb_enter_notify_event_t = @ptrCast(@alignCast(ev));
                 // Windows gliding under a still pointer must not steal focus, nor must grab crossings.
@@ -615,13 +702,31 @@ const WM = struct {
                 wm.launcher.close();
             },
             .calc => {
-                _ = wm.store.add("calc", wm.launcher.calcText(), "", 0, 8000, panel_mod.nowMs());
+                _ = wm.store.add("calc", "zwm", wm.launcher.calcText(), "", 0, store_mod.toast_default_ms, panel_mod.nowMs());
                 wm.launcher.close();
             },
         }
     }
 
-    fn onClick(wm: *WM, e: *c.xcb_button_press_event_t) void {
+    /// Super+L. The launcher gives way: it would hold the keyboard grab otherwise.
+    fn lockScreen(wm: *WM) void {
+        wm.launcher.close();
+        if (!wm.lock.open()) wm.notify("No se pudo bloquear", "Otra aplicación tiene el teclado o el puntero.");
+    }
+
+    /// Local notification (a toast from the WM itself, not from a client).
+    fn notify(wm: *WM, summary: []const u8, body: []const u8) void {
+        _ = wm.store.add("zwm", "zwm", summary, body, 0, store_mod.toast_default_ms, panel_mod.nowMs());
+    }
+
+    /// PAM accepted the password: put the keyboard back where it was.
+    fn unlocked(wm: *WM) void {
+        wm.setFocus(wm.focus);
+    }
+
+    fn onButtonPress(wm: *WM, e: *c.xcb_button_press_event_t) void {
+        if (wm.lock.visible()) return; // clicks land on the lock window; nothing underneath may act
+        
         if (wm.launcher.visible()) {
             wm.launcherResult(wm.launcher.click(e.event, e.event_y));
         } else if (wm.toasts.idAt(e.event)) |id| {
@@ -647,6 +752,8 @@ const WM = struct {
             wm.store.net_dirty = true; // e.g. ethernet plugged in while connected: no StateChanged
         }
         if (wm.store.music_dirty) wm.dbus.refreshMusic();
+        // The cover is only fetched while the panel is open, and dropped when nothing plays.
+        wm.art.want(&wm.store, if (wm.panel.visible() and wm.store.music.have) wm.store.music.artUrlSlice() else "");
         if (wm.store.net_dirty) wm.dbus.refreshNet();
         if (wm.panel.visible() and wm.store.music.playing and now - wm.last_pos_ms >= 1000) {
             wm.last_pos_ms = now;
@@ -655,11 +762,15 @@ const WM = struct {
     }
 
     fn redrawAll(wm: *WM, force: bool) void {
+        if (wm.lock.visible()) { // only the lock is on screen; the bar and panel stay untouched under it
+            wm.lock.render(anim.nowNs());
+            return;
+        }
         const now = panel_mod.nowMs();
         wm.redrawBar(force);
         wm.widget.draw(&wm.store, force);
         wm.toasts.sync(&wm.store, now, wm.panel.visible());
-        wm.panel.draw(&wm.store, force);
+        wm.panel.draw(&wm.store, &wm.art, force);
     }
 
     /// poll() budget while idle: the clock only changes once a minute, unless a toast, the
@@ -685,11 +796,12 @@ const WM = struct {
     }
 
     fn run(wm: *WM) void {
-        var pfd: [4]c.struct_pollfd = undefined;
+        var pfd: [6]c.struct_pollfd = undefined;
         wm.last_minute = minuteNow();
         wm.redrawAll(true);
         _ = c.xcb_flush(wm.conn); // first paint before anything slow (volume probe, app scan)
         wm.vol.request(null);
+        wm.brightness.request();
         wm.runAutostart();
         while (wm.running) {
             while (c.xcb_poll_for_event(wm.conn)) |ev| {
@@ -699,8 +811,10 @@ const WM = struct {
             if (c.xcb_connection_has_error(wm.conn) != 0) break;
             wm.dbus.process();
             wm.vol.service(&wm.store.status);
+            wm.art.service(&wm.store);
             const now = panel_mod.nowMs();
             wm.refreshData(now);
+            wm.brightness.service(&wm.store.status);
 
             // Animations: dt is measured, so uneven wakeups still look even. After idling, the
             // first frame advances by exactly one frame interval instead of the whole idle time.
@@ -712,7 +826,8 @@ const WM = struct {
             wm.redrawAll(false);
             _ = c.xcb_flush(wm.conn);
             if (!wm.running) break;
-            if (!wm.apps_warm and !wm.animating) {
+            // Not while the launcher shows results: a rescan would reorder the list its matches index into.
+            if (!wm.apps_warm and !wm.animating and !wm.launcher.visible()) {
                 // First idle moment: scan the .desktop files now so the first Alt+Space is instant.
                 wm.apps_warm = true;
                 wm.launcher.db.load();
@@ -720,7 +835,9 @@ const WM = struct {
             pfd[0] = .{ .fd = c.xcb_get_file_descriptor(wm.conn), .events = c.POLLIN, .revents = 0 };
             const n0 = 1 + wm.dbus.pollFill(pfd[1..3]);
             pfd[n0] = .{ .fd = wm.vol.pollFd(), .events = c.POLLIN, .revents = 0 }; // -1 = ignored by poll
-            const n = n0 + 1;
+            pfd[n0 + 1] = .{ .fd = wm.brightness.pollFd(), .events = c.POLLIN, .revents = 0 };
+            pfd[n0 + 2] = .{ .fd = wm.art.pollFd(), .events = c.POLLIN, .revents = 0 };
+            const n = n0 + 3;
             if (wm.animating) {
                 _ = anim.waitUntil(pfd[0..@intCast(n)], t0 + anim.frame_ns);
             } else {
@@ -760,11 +877,13 @@ pub fn main() !void {
         .panel = .{ .conn = conn, .screen = screen },
         .toasts = .{ .conn = conn, .screen = screen },
         .launcher = .{ .conn = conn, .screen = screen },
+        .lock = .{ .conn = conn, .screen = screen },
         .tree = .{ .gpa = std.heap.c_allocator },
         .saved = [_]Saved{.{ .tree = .{ .gpa = std.heap.c_allocator } }} ** cfg.workspaces,
         .wm_protocols = WM.atom(conn, "WM_PROTOCOLS"),
         .wm_delete = WM.atom(conn, "WM_DELETE_WINDOW"),
         .wm_type = WM.atom(conn, "_NET_WM_WINDOW_TYPE"),
+        .wm_desktop = WM.atom(conn, "_NET_WM_DESKTOP"),
         .float_types = .{
             WM.atom(conn, "_NET_WM_WINDOW_TYPE_DIALOG"),
             WM.atom(conn, "_NET_WM_WINDOW_TYPE_SPLASH"),
@@ -785,8 +904,10 @@ pub fn main() !void {
 
 test {
     _ = @import("calc.zig");
+    _ = @import("intent.zig");
     _ = @import("store.zig");
     _ = @import("apps.zig");
     _ = @import("panel.zig");
     _ = @import("tree.zig");
+    _ = @import("lock.zig");
 }

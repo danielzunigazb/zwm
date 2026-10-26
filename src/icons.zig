@@ -2,7 +2,7 @@
 
 const gfx = @import("gfx.zig");
 
-pub const Kind = enum { volume, wifi, battery, note, prev, next, pause, play };
+pub const Kind = enum { volume, wifi, battery, brightness, note, prev, next, pause, play };
 
 pub fn draw(cv: *gfx.Canvas, kind: Kind, x: f32, y: f32, size: f32, color: u32) void {
     const k = size / 24.0;
@@ -68,5 +68,17 @@ pub fn draw(cv: *gfx.Canvas, kind: Kind, x: f32, y: f32, size: f32, color: u32) 
             o.poly(&.{ .{ 14, 4 }, .{ 18, 4 }, .{ 18, 20 }, .{ 14, 20 } });
         },
         .play => o.poly(&.{ .{ 6, 3 }, .{ 20, 12 }, .{ 6, 21 } }),
+        .brightness => {
+            // Sun icon with rays
+            o.arc(12, 12, 4, 0, 360); // center circle
+            o.ln(12, 3, 12, 6);
+            o.ln(12, 18, 12, 21);
+            o.ln(3, 12, 6, 12);
+            o.ln(18, 12, 21, 12);
+            o.ln(6, 6, 8, 8);
+            o.ln(16, 16, 18, 18);
+            o.ln(6, 18, 8, 16);
+            o.ln(16, 6, 18, 8);
+        },
     }
 }

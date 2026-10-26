@@ -37,6 +37,7 @@ fi
 state="${XDG_STATE_HOME:-$HOME/.local/state}/zwm"
 [ -d "$state" ] || mkdir -p "$state" 2>/dev/null
 log="$state/zwm.log"
+[ -w "$state" ] || log=/dev/null # unwritable state dir: the WM must still start
 if [ -s "$log" ] && [ "$(wc -c <"$log")" -gt 1048576 ]; then mv -f "$log" "$log.old"; fi
 
 # Seconds since boot, without forking `date`.

@@ -3,19 +3,19 @@
 pub const mod_mask: u16 = 64; // Super. (8 = Alt)
 pub const gap: u16 = 6;
 pub const border: u16 = 2;
-pub const border_focus: u32 = 0x88c0d0;
-pub const border_normal: u32 = 0x3b4252;
+pub const border_focus: u32 = 0x4796d9; // ok: bright blue
+pub const border_normal: u32 = 0x636c7e; // ok: black / dark gray
 pub const resize_step: f32 = 0.03;
 
 // Bar. Height + gap above is reserved at the top of the screen.
 pub const bar_h: u16 = 32;
 pub const bar_radius: u16 = 10;
-pub const bar_bg: u32 = 0x3b4252;
-pub const desktop_bg: u32 = 0x2e3440;
-pub const accent: u32 = 0x88c0d0;
-pub const fg: u32 = 0xd8dee9;
-pub const fg_bright: u32 = 0xeceff4;
-pub const fg_dim: u32 = 0xa9b3c6;
+pub const bar_bg: u32 = 0x161a22; // ok bg lifted a step, so the bar reads as a surface
+pub const desktop_bg: u32 = 0x0b0d10; // ok: background
+pub const accent: u32 = 0x4796d9; // ok: bright blue
+pub const fg: u32 = 0xb5cdbd; // ok: gray
+pub const fg_bright: u32 = 0xd2daf4; // ok: white
+pub const fg_dim: u32 = 0x636c7e; // ok: dark gray
 pub const terminal = "xterm";
 
 // Claude Code in a fresh terminal, rooted at ~/Proyectos. (claude lives in ~/.local/bin, which a
@@ -35,13 +35,13 @@ pub const k_launcher: f32 = 30;
 pub const Dir4 = enum { left, up, right, down };
 pub const workspaces = 5;
 
-pub const Action = enum { spawn_terminal, close, quit, focus, swap, resize, workspace, send_to, toggle_panel, music_toggle, music_next, music_prev, volume, launcher, spawn };
+pub const Action = enum { spawn_terminal, close, quit, focus, swap, resize, workspace, send_to, toggle_panel, music_toggle, music_next, music_prev, volume, brightness, launcher, lock, spawn };
 
 // Extra modifier bits on top of mod_mask.
 const shift: u16 = 1;
 const alt: u16 = 8;
 
-// `mod = false` grabs the key without the Super modifier (media keys). `cmd` is for .volume.
+// `mod = false` grabs the key without the Super modifier (media keys). `cmd` is the shell command for .volume and .spawn.
 pub const Bind = struct { extra: u16 = 0, mod: bool = true, keysym: u32, action: Action, dir: Dir4 = .left, n: u8 = 0, cmd: [*:0]const u8 = "" };
 
 const left = 0xff51;
@@ -63,6 +63,7 @@ const base = [_]Bind{
     .{ .keysym = 'c', .action = .spawn, .cmd = claude_cmd }, // Super+C: new Claude session
     .{ .keysym = ' ', .action = .toggle_panel },
     .{ .mod = false, .extra = alt, .keysym = ' ', .action = .launcher }, // Alt+Space
+    .{ .keysym = 'l', .action = .lock }, // Super+L: lock screen (password)
 
     // Media keys (no modifier): XF86Audio{Mute,LowerVolume,RaiseVolume,Prev,Play,Next}.
     .{ .mod = false, .keysym = 0x1008ff12, .action = .volume, .cmd = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle" },
@@ -71,6 +72,9 @@ const base = [_]Bind{
     .{ .mod = false, .keysym = 0x1008ff16, .action = .music_prev },
     .{ .mod = false, .keysym = 0x1008ff14, .action = .music_toggle },
     .{ .mod = false, .keysym = 0x1008ff17, .action = .music_next },
+    // Brightness keys
+    .{ .mod = false, .keysym = 0x1008ff02, .action = .brightness, .cmd = "brightnessctl set +5%" },  // XF86KbdBrightnessUp
+    .{ .mod = false, .keysym = 0x1008ff03, .action = .brightness, .cmd = "brightnessctl set 5%-" },  // XF86KbdBrightnessDown
     .{ .extra = shift, .keysym = 'e', .action = .quit },
 
     .{ .keysym = left, .action = .focus, .dir = .left },

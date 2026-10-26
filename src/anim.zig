@@ -1,6 +1,6 @@
 // Frame-rate independent smoothing. Everything animated in the WM chases a target with
-// critically-damped exponential decay: retargeting mid-flight never jumps, and the
-// result is the same whatever the frame pacing is.
+// first-order exponential approach: retargeting mid-flight never jumps, and the
+// result is the same whatever the frame pacing is. (Not a spring: no overshoot, no damping term.)
 
 const std = @import("std");
 const cfg = @import("config.zig");
