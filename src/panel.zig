@@ -59,7 +59,7 @@ pub fn nowMs() i64 {
 
 // ---- side panel ----
 
-pub const Click = union(enum) { prev, play, next, dismiss: u32 };
+pub const Click = union(enum) { prev, play, next, lyrics, dismiss: u32 };
 
 const Hit = struct { x: i32, y: i32, w: i32, h: i32, what: Click };
 
@@ -253,6 +253,13 @@ pub const Panel = struct {
             }
             var eb: [16]u8 = undefined;
             _ = cv.textAt(x0, by + 4 + 4 + 11, clock(&eb, m.pos_us), cfg.fg_dim, 11, false);
+            if (cfg.lyrics) { // the lyrics switch sits between the two times
+                const pw: i32 = 46;
+                const px = x0 + @divTrunc(cw - pw, 2);
+                cv.roundRect(px, by + 7, pw, 17, 8.5, if (st.lyrics_on) cfg.accent else 0x333640);
+                _ = cv.textAt(px + 7, by + 19, "letra", if (st.lyrics_on) cfg.bar_bg else cfg.fg_dim, 11, true);
+                p.addHit(px - 4, by + 4, pw + 8, 24, .lyrics);
+            }
             if (m.len_us > 0) {
                 var lb: [16]u8 = undefined;
                 const total = clock(&lb, m.len_us);

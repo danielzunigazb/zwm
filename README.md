@@ -52,6 +52,7 @@ Requiere **Zig 0.16**. Además, en tiempo de ejecución:
 - NetworkManager, para el nombre de la red y el tipo de conexión.
 - Opcional: cualquier reproductor con MPRIS (Spotify, mpv, navegadores...) para la tarjeta de música.
 - Opcional: `imagemagick` (y `curl` para portadas remotas) para mostrar la portada del álbum. Sin ellos la tarjeta muestra una nota musical.
+- Opcional: `curl` también para la [letra sincronizada](#letra-sincronizada) del escritorio. Sin él, no hay letra (salvo la que ya esté en la caché).
 - Opcional: la fuente **JetBrains Mono** (o JetBrains Mono Nerd Font Mono) en `/usr/share/fonts/`.
 - Opcional: `xterm`, que es la terminal que abre `Super+Return`.
 - Opcional, para las órdenes de música: `python3` (solo biblioteca estándar), `notify-send` (libnotify) y Spotify Premium; ver [Música](#música-por-teclado-pon-).
@@ -190,6 +191,7 @@ Ver [Bloqueo de pantalla](#bloqueo-de-pantalla).
 - **Clic en un toast** lo cierra (la notificación sigue en el panel).
 - **Clic en una notificación del panel** la descarta.
 - **Clic en ⏮ / ⏯ / ⏭** en la tarjeta de música del panel: anterior, reproducir/pausar y siguiente.
+- **Clic en «letra»** (la píldora entre el tiempo transcurrido y la duración): muestra u oculta la letra del escritorio.
 - **Clic en una fila del lanzador** la selecciona y la ejecuta, igual que `Return`.
 - Durante el bloqueo, los clics se ignoran.
 
@@ -300,6 +302,32 @@ Cuando el escritorio está vacío (o detrás de las ventanas), se ve en la esqui
 
 El widget queda siempre **por debajo** de las ventanas en mosaico.
 
+### Letra sincronizada
+
+Mientras suena una canción con letra sincronizada, en el centro del escritorio aparecen tres líneas: la
+anterior y la siguiente atenuadas, y la actual resaltada. Al cambiar de línea el bloque sube con un
+resorte críticamente amortiguado (sin rebote, arranca suave y frena suave) mientras los colores se
+funden: la línea que termina se apaga, la que entra se enciende y la que sale se desvanece. Como el
+widget, queda por debajo de las ventanas, así que se ve en los workspaces vacíos.
+
+- **De dónde sale.** De [lrclib.net](https://lrclib.net) (formato LRC, sin clave de API). Funciona con
+  cualquier fuente de música: un reproductor MPRIS local o Spotify en otro dispositivo.
+- **Cómo se busca.** Un hijo `curl` (el bucle de eventos nunca espera a la red) con tres intentos: título
+  exacto, título sin decoraciones (`Canción - Remastered 2011`, `(feat. X)`, `[Live]`) y, por último,
+  `/api/search` eligiendo el candidato cuya duración más se acerque. Los argumentos van directos a `curl`,
+  sin shell. Si no hay letra, simplemente no se muestra nada.
+- **Caché en disco.** Cada letra encontrada se guarda en `~/.cache/zwm/lyrics/<hash>.lrc` (o
+  `$XDG_CACHE_HOME/zwm/lyrics/`), con permisos `600` y escritura atómica. Las siguientes veces sale de
+  ahí, sin red. No hay caché negativa ni límite de tamaño (unos 4 KB por canción).
+- **Sincronía.** Usa la posición que ya mantiene la tarjeta de música y la hace avanzar con el reloj. El
+  WM solo despierta en el instante exacto de cada cambio de línea, no cada segundo. `lyrics_lead_ms`
+  adelanta cada línea unos milisegundos para compensar la latencia de la posición de Spotify.
+- **Interruptor.** El botón **letra** de la tarjeta de música del panel la enciende y la apaga al
+  momento: apagada se cierra la ventana y no se hace ninguna consulta; al encenderla vuelve, desde la
+  caché si ya la tenía. Arranca según `lyrics` en `config.zig` y no se recuerda entre reinicios.
+- **Privacidad.** El título, el artista y la duración de lo que suena se envían a lrclib.net. Con
+  `lyrics = false` en `config.zig` no se hace ninguna consulta ni aparece el botón.
+
 ---
 
 ## Panel lateral
@@ -313,6 +341,8 @@ mismo atajo. Tiene tres tarjetas:
    (móvil, otro PC; ver [Música por teclado](#música-por-teclado-pon-)). Muestra la portada del álbum
    (esquinas redondeadas), el título, el artista (con el dispositivo si no es este PC), los controles
    ⏮ ⏯ ⏭ junto a la portada y debajo una barra de progreso con el tiempo transcurrido y la duración.
+   Entre los dos tiempos hay un botón **letra** (azul = encendida) que activa o desactiva la
+   [letra sincronizada](#letra-sincronizada) del escritorio.
    La posición se actualiza cada segundo mientras suena. Si ambos suenan a la vez, gana el de este PC.
 3. **Notificaciones.** La lista de las últimas notificaciones (hasta 16), con la aplicación, el resumen y
    el contador. Un clic descarta una.
@@ -530,6 +560,8 @@ fichero y recompila (`zig build` o `./install.sh`).
 | `claude_cmd` | `xterm ... claude` en `~/Proyectos` | Comando de `Super+c` |
 | `anim_hz` | `144` | Cuadros por segundo de las animaciones |
 | `k_window`, `k_workspace`, `k_pill`, `k_panel`, `k_toast`, `k_launcher` | `26`, `22`, `32`, `24`, `26`, `30` | Velocidad de cada animación (mayor = más rápida) |
+| `lyrics`, `lyrics_lead_ms` | `true`, `200` | Letra sincronizada (también su estado inicial); milisegundos que se adelanta cada línea |
+| `k_lyrics` | `11` | Rigidez del resorte del desplazamiento de la letra (mayor = más rápido) |
 | `workspaces` | `5` | Número de workspaces |
 | `binds` | ver `config.zig` | Tabla de atajos: tecla, modificadores y acción |
 
@@ -547,6 +579,7 @@ tengas en `~/.Xresources` tiene prioridad sobre él.
 |---|---:|---|
 | `src/main.zig` | 901 | Bucle principal, ventanas, workspaces, atajos, animaciones, bloqueo, arranque |
 | `src/panel.zig` | 514 | Panel lateral, widget de escritorio y toasts |
+| `src/lyrics.zig` | 698 | Letra sincronizada: parser LRC, consulta a lrclib con `curl`, caché y dibujo animado |
 | `src/gfx.zig` | 456 | Canvas por software, fuente de mapa de bits (PSF) y TTF (FreeType), superficies X |
 | `src/lock.zig` | 448 | Pantalla de bloqueo: dibujo, animación, teclado y acentos |
 | `src/dbus.zig` | 325 | Servidor de notificaciones, MPRIS y NetworkManager |

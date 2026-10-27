@@ -32,6 +32,12 @@ pub const k_panel: f32 = 24;
 pub const k_toast: f32 = 26;
 pub const k_launcher: f32 = 30;
 
+// Synced lyrics on the desktop (from lrclib.net, cached in ~/.cache/zwm/lyrics). Turning it off
+// stops the lookups: the song's title and artist are sent to lrclib to find its lyrics.
+pub const lyrics: bool = true;
+pub const lyrics_lead_ms: i64 = 200; // show each line this early: Spotify's position is already stale when it arrives
+pub const k_lyrics: f32 = 11; // scroll spring stiffness (1/s): larger = snappier, ~0.4 s to settle at 11
+
 pub const Dir4 = enum { left, up, right, down };
 pub const workspaces = 5;
 

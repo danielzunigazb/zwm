@@ -25,6 +25,24 @@ pub fn settle(cur: *f32, target: f32, dt: f32, k: f32) bool {
     return true;
 }
 
+/// Critically damped spring toward `target` (ease-in, ease-out, no overshoot); true while moving.
+/// `settle` is right for things that react to input; this is for scheduled moves (a lyric line
+/// changing) where starting at full speed would read as a jerk. `eps` is the snap distance.
+pub fn smooth(cur: *f32, vel: *f32, target: f32, dt: f32, omega: f32, eps: f32) bool {
+    if (cur.* == target and vel.* == 0) return false;
+    const e = @exp(-omega * dt);
+    const delta = cur.* - target;
+    const t = (vel.* + omega * delta) * dt;
+    vel.* = (vel.* - omega * t) * e;
+    cur.* = target + (delta + t) * e;
+    if (@abs(target - cur.*) < eps and @abs(vel.*) < eps * 8) {
+        cur.* = target;
+        vel.* = 0;
+        return false;
+    }
+    return true;
+}
+
 pub fn round(v: f32) i32 {
     return @intFromFloat(@round(v));
 }
@@ -43,4 +61,21 @@ pub fn waitUntil(pfd: []c.struct_pollfd, deadline: i64) c_int {
         }
     }
     return r;
+}
+
+test "smooth: arrives without overshooting, starting gently" {
+    var x: f32 = 0;
+    var v: f32 = 0;
+    var prev: f32 = 0;
+    var first_step: f32 = 0;
+    var frames: usize = 0;
+    while (smooth(&x, &v, 56, 1.0 / 144.0, 11, 0.3)) : (frames += 1) {
+        try std.testing.expect(x >= prev and x <= 56); // monotonic, never past the target
+        if (frames == 0) first_step = x;
+        prev = x;
+        try std.testing.expect(frames < 144); // settles within a second
+    }
+    try std.testing.expectEqual(@as(f32, 56), x);
+    try std.testing.expectEqual(@as(f32, 0), v);
+    try std.testing.expect(first_step < 0.2); // eases in: settle() would have covered ~7 px in the first frame
 }

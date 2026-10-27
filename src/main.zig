@@ -9,6 +9,7 @@ const dbus_mod = @import("dbus.zig");
 const sys = @import("sys.zig");
 const Launcher = @import("launcher.zig").Launcher;
 const Lock = @import("lock.zig").Lock;
+const Lyrics = @import("lyrics.zig").Lyrics;
 const anim = @import("anim.zig");
 
 const Tree = tree_mod.Tree;
@@ -31,6 +32,7 @@ const WM = struct {
     toasts: panel_mod.Toasts,
     launcher: Launcher,
     lock: Lock,
+    lyrics: Lyrics,
     syms: ?*c.xcb_key_symbols_t = null,
     store: store_mod.Store = .{},
     dbus: dbus_mod.Dbus = .{},
@@ -271,6 +273,7 @@ const WM = struct {
         moving = wm.toasts.step(dt) or moving;
         moving = wm.launcher.step(dt) or moving;
         moving = wm.lock.step(dt) or moving;
+        moving = wm.lyrics.step(dt) or moving;
         return moving;
     }
 
@@ -669,6 +672,7 @@ const WM = struct {
                 if (e.count != 0) return;
                 if (e.window == wm.bar.surf.win) wm.bar.surf.flush();
                 wm.widget.expose(e.window);
+                wm.lyrics.expose(e.window);
                 wm.panel.expose(e.window);
                 wm.toasts.expose(e.window);
                 wm.launcher.expose(e.window);
@@ -736,6 +740,10 @@ const WM = struct {
             .prev => wm.musicControl(.prev),
             .play => wm.musicControl(.toggle),
             .next => wm.musicControl(.next),
+            .lyrics => {
+                wm.store.lyrics_on = !wm.store.lyrics_on;
+                wm.store.version +%= 1; // the panel repaints the switch; refreshData starts or drops the lyrics
+            },
             .dismiss => |id| wm.store.dismiss(id),
         };
     }
@@ -776,7 +784,8 @@ const WM = struct {
         // The cover is only fetched while the panel is open, and dropped when nothing plays.
         wm.art.want(&wm.store, if (wm.panel.visible() and wm.store.music.have) wm.store.music.artUrlSlice() else "");
         if (wm.store.net_dirty) wm.dbus.refreshNet();
-        if (wm.panel.visible() and wm.store.music.playing and now - wm.last_pos_ms >= 1000) {
+        wm.lyrics.sync(&wm.store, now);
+        if ((wm.panel.visible() or wm.lyrics.active()) and wm.store.music.playing and now - wm.last_pos_ms >= 1000) {
             wm.last_pos_ms = now;
             if (wm.store.music.remote) wm.remote.tick(&wm.store, now) else wm.dbus.refreshPosition();
         }
@@ -790,6 +799,7 @@ const WM = struct {
         const now = panel_mod.nowMs();
         wm.redrawBar(force);
         wm.widget.draw(&wm.store, force);
+        wm.lyrics.draw();
         wm.toasts.sync(&wm.store, now, wm.panel.visible());
         wm.panel.draw(&wm.store, &wm.art, force);
     }
@@ -802,6 +812,7 @@ const WM = struct {
         var ms: i64 = 60_000 - (@mod(@as(i64, ts.tv_sec), 60) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000)) + 20;
         if (panel_mod.Toasts.nextExpiry(&wm.store, now)) |e| ms = @min(ms, e + 5);
         if (wm.panel.visible() and wm.store.music.playing) ms = @min(ms, 1000);
+        if (wm.lyrics.wakeInMs(now)) |t| ms = @min(ms, t);
         if (wm.dbus.timeoutMs()) |t| ms = @min(ms, t);
         return @intCast(@max(ms, 0));
     }
@@ -836,6 +847,7 @@ const WM = struct {
             wm.art.service(&wm.store);
             const now = panel_mod.nowMs();
             wm.remote.service(&wm.store, now);
+            wm.lyrics.service(now);
             wm.refreshData(now);
             wm.brightness.service(&wm.store.status);
 
@@ -861,7 +873,8 @@ const WM = struct {
             pfd[n0 + 1] = .{ .fd = wm.brightness.pollFd(), .events = c.POLLIN, .revents = 0 };
             pfd[n0 + 2] = .{ .fd = wm.art.pollFd(), .events = c.POLLIN, .revents = 0 };
             pfd[n0 + 3] = .{ .fd = wm.remote.pollFd(), .events = c.POLLIN, .revents = 0 };
-            const n = n0 + 4;
+            pfd[n0 + 4] = .{ .fd = wm.lyrics.pollFd(), .events = c.POLLIN, .revents = 0 };
+            const n = n0 + 5;
             if (wm.animating) {
                 _ = anim.waitUntil(pfd[0..@intCast(n)], t0 + anim.frame_ns);
             } else {
@@ -902,6 +915,7 @@ pub fn main() !void {
         .toasts = .{ .conn = conn, .screen = screen },
         .launcher = .{ .conn = conn, .screen = screen },
         .lock = .{ .conn = conn, .screen = screen },
+        .lyrics = .{ .conn = conn, .screen = screen },
         .tree = .{ .gpa = std.heap.c_allocator },
         .saved = [_]Saved{.{ .tree = .{ .gpa = std.heap.c_allocator } }} ** cfg.workspaces,
         .wm_protocols = WM.atom(conn, "WM_PROTOCOLS"),
@@ -934,4 +948,5 @@ test {
     _ = @import("panel.zig");
     _ = @import("tree.zig");
     _ = @import("lock.zig");
+    _ = @import("lyrics.zig");
 }

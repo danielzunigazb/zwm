@@ -194,7 +194,10 @@ pub const Dbus = struct {
                 var s: [*c]const u8 = null;
                 var first = true;
                 while (c.sd_bus_message_read(r, "s", &s) > 0) {
-                    if (first) m.artist_len = store_mod.sanitize(&m.artist, std.mem.span(s));
+                    if (first) {
+                        m.artist_len = store_mod.sanitize(&m.artist, std.mem.span(s));
+                        m.setMainArtist(m.artistSlice());
+                    }
                     first = false;
                 }
                 _ = c.sd_bus_message_exit_container(r);

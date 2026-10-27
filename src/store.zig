@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const gfx = @import("gfx.zig");
+const cfg = @import("config.zig");
 
 pub const Net = enum { none, wifi, eth };
 
@@ -30,6 +31,9 @@ pub const Music = struct {
     title_len: u8 = 0,
     artist: [96]u8 = undefined,
     artist_len: u8 = 0,
+    /// The first artist alone (`artist` may carry a second one and the device): what lyrics are looked up by.
+    artist_main: [64]u8 = undefined,
+    artist_main_len: u8 = 0,
     art_url: [256]u8 = undefined,
     art_url_len: u8 = 0,
     pos_us: i64 = 0,
@@ -40,6 +44,15 @@ pub const Music = struct {
     }
     pub fn artistSlice(m: *const Music) []const u8 {
         return m.artist[0..m.artist_len];
+    }
+    pub fn mainArtistSlice(m: *const Music) []const u8 {
+        return m.artist_main[0..m.artist_main_len];
+    }
+
+    /// Set `artist_main` from a display string like "A, B": everything before the first comma.
+    pub fn setMainArtist(m: *Music, artists: []const u8) void {
+        const first = if (std.mem.indexOf(u8, artists, ", ")) |i| artists[0..i] else artists;
+        m.artist_main_len = sanitize(&m.artist_main, first);
     }
     pub fn artUrlSlice(m: *const Music) []const u8 {
         return m.art_url[0..m.art_url_len];
@@ -154,6 +167,8 @@ pub const Store = struct {
 
     music_dirty: bool = true,
     net_dirty: bool = true,
+    /// The panel's lyrics switch. Starts as configured; not remembered across restarts.
+    lyrics_on: bool = cfg.lyrics,
 
     /// Pick what to show: a local player that is playing wins (no point mirroring what this PC
     /// plays), then Spotify playing elsewhere, then whichever is merely paused (local first).

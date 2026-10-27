@@ -486,6 +486,7 @@ fn parseLine(text: []const u8) store.Music {
     m.remote = true;
     m.playing = state[0] == 'P';
     m.title_len = store.sanitize(&m.title, title);
+    m.setMainArtist(artist);
     // The device goes after the artist so it is clear this is not playing on this PC.
     var ab: [160]u8 = undefined;
     const shown = if (device.len > 0) std.fmt.bufPrint(&ab, "{s} \xc2\xb7 {s}", .{ artist, device }) catch artist else artist;
