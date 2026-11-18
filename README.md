@@ -62,7 +62,7 @@ Requiere **Zig 0.16**. Además, en tiempo de ejecución:
 ## Compilar, probar e instalar
 
 ```sh
-zig build            # compila en zig-out/bin/wm
+zig build            # compila zig-out/bin/wm (el WM) y zig-out/bin/zwm-watch (el vigilante de Spotify)
 zig build test       # tests unitarios: calculadora, apps (.desktop), store (notificaciones), panel (ajuste de texto), árbol BSP
 zig build run        # arranca el WM dentro de la sesión X actual (DISPLAY)
 ```
@@ -81,6 +81,7 @@ Para instalarlo como sesión de inicio de sesión (SDDM, GDM, LightDM...):
 | `/usr/local/bin/zwm` | el WM |
 | `/usr/local/bin/zwm-session` | el script de sesión X |
 | `/usr/local/bin/zwm-music` | helper de música (Spotify Connect) del lanzador |
+| `/usr/local/bin/zwm-watch` | vigilante de lo que suena en otros dispositivos de Spotify |
 | `/usr/share/xsessions/zwm.desktop` | entrada de sesión para el gestor de inicio |
 | `/usr/local/share/zwm/zwm.Xresources` | tema de `xterm` |
 | `~/.config/zwm/autostart` | programas de arranque del usuario (solo si no existe) |
@@ -585,28 +586,29 @@ tengas en `~/.Xresources` tiene prioridad sobre él.
 
 | Fichero | Líneas | Responsabilidad |
 |---|---:|---|
-| `src/main.zig` | 901 | Bucle principal, ventanas, workspaces, atajos, animaciones, bloqueo, arranque |
-| `src/panel.zig` | 514 | Panel lateral, widget de escritorio y toasts |
-| `src/lyrics.zig` | 698 | Letra sincronizada: parser LRC, consulta a lrclib con `curl`, caché y dibujo animado |
-| `src/gfx.zig` | 456 | Canvas por software, fuente de mapa de bits (PSF) y TTF (FreeType), superficies X |
+| `src/main.zig` | 1042 | Bucle principal, ventanas, workspaces, atajos, animaciones, EWMH, bloqueo, arranque |
+| `src/lyrics.zig` | 697 | Letra sincronizada: parser LRC, consulta a lrclib con `curl`, caché y dibujo animado |
+| `src/panel.zig` | 550 | Panel lateral, widget de escritorio y toasts |
+| `src/sys.zig` | 525 | Volumen con `wpctl` sin bloquear, ejecución de comandos y lanzamiento de `zwm-watch` |
+| `src/gfx.zig` | 476 | Canvas por software, fuente de mapa de bits (PSF) y TTF (FreeType), superficies X |
 | `src/lock.zig` | 448 | Pantalla de bloqueo: dibujo, animación, teclado y acentos |
-| `src/dbus.zig` | 325 | Servidor de notificaciones, MPRIS y NetworkManager |
+| `src/watch.zig` | 387 | `zwm-watch`: binario estático que consulta la Web API de Spotify y emite lo que suena en cualquier dispositivo |
+| `src/dbus.zig` | 339 | Servidor de notificaciones, MPRIS y NetworkManager |
+| `src/store.zig` | 320 | Estado compartido: notificaciones (con propietario), música, red, volumen |
 | `src/apps.zig` | 293 | Lectura de `.desktop`, búsqueda difusa y contadores de uso |
 | `src/launcher.zig` | 288 | Lanzador `Alt+Space` |
-| `src/intent.zig` | 177 | Órdenes de música del lanzador («pon ...», «pausa») |
-| `src/store.zig` | 248 | Estado compartido: notificaciones (con propietario), música, red, volumen |
 | `src/tree.zig` | 182 | Árbol BSP del mosaico |
+| `src/intent.zig` | 177 | Órdenes de música del lanzador («pon ...», «pausa») |
 | `src/bar.zig` | 173 | Barra superior y lectura de batería |
-| `src/sys.zig` | 152 | Volumen con `wpctl` sin bloquear, y ejecución de comandos |
 | `src/calc.zig` | 145 | Evaluador de expresiones de la calculadora |
-| `src/icons.zig` | 72 | Iconos vectoriales (volumen, Wi-Fi, batería, música) |
+| `src/config.zig` | 100 | Configuración en tiempo de compilación |
+| `src/icons.zig` | 84 | Iconos vectoriales (volumen, Wi-Fi, batería, música) |
+| `src/anim.zig` | 81 | Aproximación exponencial y `poll` con horario fijo |
 | `src/auth.zig` | 57 | Comprobación de contraseña con PAM |
-| `src/config.zig` | 91 | Configuración en tiempo de compilación |
-| `src/anim.zig` | 46 | Aproximación exponencial y `poll` con horario fijo |
 | `src/c.zig` | 21 | Importación de las cabeceras de C |
 | `session/` | | Script de sesión, entrada `.desktop`, tema de `xterm`, autostart de ejemplo |
-| `session/zwm-music` | 269 | Helper de música: autorización PKCE, búsqueda y control por la Web API de Spotify |
-| `install.sh` | 24 | Instalación y desinstalación |
+| `session/zwm-music` | 289 | Helper de música: autorización PKCE, búsqueda y control por la Web API de Spotify |
+| `install.sh` | 25 | Instalación y desinstalación |
 
 **Flujo general.** Un único hilo espera con `poll` sobre la conexión X, los buses D-Bus y el proceso de
 volumen. Cada vuelta procesa los eventos X, avanza las animaciones, repinta lo que cambió y se duerme
@@ -647,7 +649,9 @@ pasada:
   con la extensión SHAPE.
 - **Ruta fija.** `claude_cmd` y el autostart de ejemplo usan `~/Proyectos`.
 - **Música solo con Spotify Premium** y una app propia en el panel de desarrolladores de Spotify. La
-  parte de Spotify se probó con la API simulada, no contra el servicio real. La tarjeta de música del
-  panel solo ve reproductores MPRIS locales, no lo que suena en otro dispositivo.
-- El directorio `.zig-cache/` ocupa unos 760 MB. Está en `.gitignore`, pero conviene borrarlo si hace falta
-  espacio (`rm -rf .zig-cache`).
+  parte de Spotify se probó con la API simulada, no contra el servicio real.
+
+---
+
+<sub>El directorio `.zig-cache/` ocupa unos 760 MB. Está en `.gitignore`, pero conviene borrarlo si hace
+falta espacio (`rm -rf .zig-cache`).</sub>
