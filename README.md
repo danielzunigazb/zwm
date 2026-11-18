@@ -248,6 +248,14 @@ se tocan, y las ocultas sin marca de workspace se ignoran.
 **Cerrar una ventana.** `Super+q` envía `WM_DELETE_WINDOW`, y el programa decide si cierra. Si el
 programa no soporta ese protocolo, se mata la conexión X.
 
+**EWMH básico.** El WM se anuncia con `_NET_SUPPORTING_WM_CHECK` (una ventana oculta con
+`_NET_WM_NAME` = `zwm`) y publica en `_NET_SUPPORTED` lo que soporta: `_NET_ACTIVE_WINDOW` y los tipos de
+`_NET_WM_WINDOW_TYPE` que hacen flotar una ventana. `_NET_ACTIVE_WINDOW` sigue al foco: la ventana
+enfocada, la flotante recién abierta, o `None` si el workspace está vacío. Si se cierra u oculta la ventana
+activa (un diálogo), el foco vuelve a la ventana del mosaico que lo tenía. Al salir del WM se borran estas
+propiedades de la raíz. Todavía no hay `_NET_CLIENT_LIST`, `_NET_CURRENT_DESKTOP` ni activación de ventanas
+por mensaje `_NET_ACTIVE_WINDOW`.
+
 ---
 
 ## Workspaces

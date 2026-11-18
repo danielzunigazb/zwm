@@ -48,6 +48,10 @@ const WM = struct {
     wm_type: c.xcb_atom_t, // _NET_WM_WINDOW_TYPE
     wm_desktop: c.xcb_atom_t, // _NET_WM_DESKTOP: which workspace a window belongs to
     float_types: [8]c.xcb_atom_t, // types that float instead of tiling
+    net_supported: c.xcb_atom_t,
+    net_check: c.xcb_atom_t, // _NET_SUPPORTING_WM_CHECK
+    net_active: c.xcb_atom_t, // _NET_ACTIVE_WINDOW
+    active: u32 = 0, // what _NET_ACTIVE_WINDOW on root says right now (0 = None)
     running: bool = true,
     ghosts: [Tree.max_leaves]Ghost = undefined,
     n_ghosts: usize = 0,
@@ -109,6 +113,78 @@ const WM = struct {
         return if (v.* < cfg.workspaces) v.* else null;
     }
 
+    /// Basic EWMH: a check window that names the WM, the hints it honours (_NET_SUPPORTED), and
+    /// _NET_ACTIVE_WINDOW, which `setActive` keeps in step with the focus. Bars and window
+    /// switchers read these. Overwrites whatever a previous WM instance left on root.
+    fn setupEwmh(wm: *WM) void {
+        const P = c.XCB_PROP_MODE_REPLACE;
+        // Never mapped; override-redirect so adopt() and MapRequest never treat it as a client.
+        const check = c.xcb_generate_id(wm.conn);
+        const ovr = [_]u32{1};
+        _ = c.xcb_create_window(wm.conn, 0, check, wm.root, -1, -1, 1, 1, 0, c.XCB_WINDOW_CLASS_INPUT_ONLY, c.XCB_COPY_FROM_PARENT, c.XCB_CW_OVERRIDE_REDIRECT, &ovr);
+        const cw = [_]u32{check};
+        _ = c.xcb_change_property(wm.conn, P, check, wm.net_check, c.XCB_ATOM_WINDOW, 32, 1, &cw);
+        const name = "zwm";
+        _ = c.xcb_change_property(wm.conn, P, check, atom(wm.conn, "_NET_WM_NAME"), atom(wm.conn, "UTF8_STRING"), 8, name.len, name.ptr);
+        _ = c.xcb_change_property(wm.conn, P, wm.root, wm.net_check, c.XCB_ATOM_WINDOW, 32, 1, &cw);
+
+        // Only what the WM really does: the check window, the active window, and the window types
+        // that make a window float (shouldFloat).
+        var list: [4 + wm.float_types.len]u32 = undefined;
+        var n: usize = 0;
+        for ([_]u32{ wm.net_supported, wm.net_check, wm.net_active, wm.wm_type } ++ wm.float_types) |a| {
+            if (a == 0) continue; // atom could not be interned
+            list[n] = a;
+            n += 1;
+        }
+        _ = c.xcb_change_property(wm.conn, P, wm.root, wm.net_supported, c.XCB_ATOM_ATOM, 32, @intCast(n), &list);
+
+        const none = [_]u32{0};
+        _ = c.xcb_change_property(wm.conn, P, wm.root, wm.net_active, c.XCB_ATOM_WINDOW, 32, 1, &none);
+        wm.active = 0;
+    }
+
+    /// On exit: claim nothing for whatever runs next (the check window goes with the connection).
+    fn dropEwmh(wm: *WM) void {
+        _ = c.xcb_delete_property(wm.conn, wm.root, wm.net_active);
+        _ = c.xcb_delete_property(wm.conn, wm.root, wm.net_supported);
+        _ = c.xcb_delete_property(wm.conn, wm.root, wm.net_check);
+        // Wait for a reply so the server has run the deletes before we disconnect: closing with
+        // unread events queued (e.g. right after a workspace switch) resets the connection, and
+        // the server then drops whatever requests it had not processed yet.
+        if (c.xcb_get_input_focus_reply(wm.conn, c.xcb_get_input_focus(wm.conn), null)) |r| std.c.free(r);
+    }
+
+    /// _NET_ACTIVE_WINDOW follows every input-focus change the WM makes (0 = None).
+    fn setActive(wm: *WM, win: u32) void {
+        if (win == wm.active) return;
+        // Log every time _NET_ACTIVE_WINDOW enters or leaves None: ActivityWatch files that time
+        // under "unknown", and this says when and on which workspace it happened.
+        if (win == 0 or wm.active == 0) {
+            var ts: c.struct_timespec = undefined;
+            _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+            const t: c.time_t = ts.tv_sec;
+            var tm: c.struct_tm = undefined;
+            _ = c.localtime_r(&t, &tm);
+            std.debug.print("{d:0>2}:{d:0>2}:{d:0>2} active 0x{x} -> 0x{x} (workspace {d})\n", .{
+                @as(u32, @intCast(tm.tm_hour)), @as(u32, @intCast(tm.tm_min)), @as(u32, @intCast(tm.tm_sec)),
+                wm.active, win, wm.cur + 1,
+            });
+        }
+        wm.active = win;
+        const v = [_]u32{win};
+        _ = c.xcb_change_property(wm.conn, c.XCB_PROP_MODE_REPLACE, wm.root, wm.net_active, c.XCB_ATOM_WINDOW, 32, 1, &v);
+    }
+
+    /// The window _NET_ACTIVE_WINDOW names was unmapped or destroyed (a floating dialog closing):
+    /// the focus goes back to the tiled window that had it, or to nothing, so the property never
+    /// names a window that is gone.
+    fn dropActive(wm: *WM, win: u32) void {
+        if (win == 0 or win != wm.active) return;
+        if (wm.focus) |f| if (f.isLeaf()) return wm.setFocus(f);
+        wm.setFocus(null);
+    }
+
     fn setBorder(wm: *WM, win: u32, color: u32) void {
         _ = c.xcb_change_window_attributes(wm.conn, win, c.XCB_CW_BORDER_PIXEL, &color);
     }
@@ -119,8 +195,10 @@ const WM = struct {
         if (n) |leaf| {
             wm.setBorder(leaf.win, cfg.border_focus);
             _ = c.xcb_set_input_focus(wm.conn, c.XCB_INPUT_FOCUS_POINTER_ROOT, leaf.win, c.XCB_CURRENT_TIME);
+            wm.setActive(leaf.win);
         } else {
             _ = c.xcb_set_input_focus(wm.conn, c.XCB_INPUT_FOCUS_POINTER_ROOT, wm.root, c.XCB_CURRENT_TIME);
+            wm.setActive(0);
         }
     }
 
@@ -310,6 +388,7 @@ const WM = struct {
         const top = [_]u32{c.XCB_STACK_MODE_ABOVE};
         _ = c.xcb_configure_window(wm.conn, win, c.XCB_CONFIG_WINDOW_STACK_MODE, &top);
         _ = c.xcb_set_input_focus(wm.conn, c.XCB_INPUT_FOCUS_POINTER_ROOT, win, c.XCB_CURRENT_TIME);
+        wm.setActive(win);
         _ = c.xcb_flush(wm.conn);
     }
 
@@ -652,11 +731,17 @@ const WM = struct {
                 wm.launcher.raise();
                 wm.lock.raise(); // a new window must never end up above the lock
             },
-            c.XCB_UNMAP_NOTIFY => wm.onUnmap(@as(*c.xcb_unmap_notify_event_t, @ptrCast(@alignCast(ev))).window),
+            c.XCB_UNMAP_NOTIFY => {
+                const win = @as(*c.xcb_unmap_notify_event_t, @ptrCast(@alignCast(ev))).window;
+                wm.onUnmap(win);
+                wm.dropActive(win);
+            },
             c.XCB_DESTROY_NOTIFY => {
-                wm.unmanage(@as(*c.xcb_destroy_notify_event_t, @ptrCast(@alignCast(ev))).window);
+                const win = @as(*c.xcb_destroy_notify_event_t, @ptrCast(@alignCast(ev))).window;
+                wm.unmanage(win);
                 // A floating window may have held the input focus.
                 if (wm.focus) |f| if (f.isLeaf()) wm.setFocus(f);
+                wm.dropActive(win);
             },
             c.XCB_CONFIGURE_REQUEST => wm.onConfigureRequest(@ptrCast(@alignCast(ev))),
             // Override-redirect windows (menus, popups) map without a MapRequest: put the lock back on
@@ -932,12 +1017,17 @@ pub fn main() !void {
             WM.atom(conn, "_NET_WM_WINDOW_TYPE_POPUP_MENU"),
             WM.atom(conn, "_NET_WM_WINDOW_TYPE_TOOLTIP"),
         },
+        .net_supported = WM.atom(conn, "_NET_SUPPORTED"),
+        .net_check = WM.atom(conn, "_NET_SUPPORTING_WM_CHECK"),
+        .net_active = WM.atom(conn, "_NET_ACTIVE_WINDOW"),
     };
+    wm.setupEwmh(); // before adopt(): its focus changes must land on a fresh _NET_ACTIVE_WINDOW
     wm.grabKeys();
     wm.dbus.connect(&wm.store);
     wm.adopt();
     _ = c.xcb_flush(conn);
     wm.run();
+    wm.dropEwmh();
 }
 
 test {
