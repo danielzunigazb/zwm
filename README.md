@@ -286,7 +286,7 @@ pantalla y reserva ese espacio al mosaico.
 
 - **Izquierda:** los números de los workspaces 1–5. La «píldora» azul marca el activo y se desliza al
   cambiar. Un número en gris indica un workspace vacío; uno en blanco, un workspace con ventanas.
-- **Centro:** hora `HH:MM` y fecha con nombres abreviados en español (`lun 19 oct`).
+- **Centro:** hora `HH:MM` y fecha con nombres abreviados en español (`mie 18 nov`).
 - **Derecha:** de derecha a izquierda, batería (`100%`, con `+` si carga), red (nombre de la Wi-Fi, `eth`,
   o `sin red`) y volumen (`40%`, o `mute`).
 
@@ -306,7 +306,7 @@ en esa ruta no bloquee el bucle principal.
 Cuando el escritorio está vacío (o detrás de las ventanas), se ve en la esquina inferior izquierda:
 
 - La hora en grande (88 px).
-- La fecha completa: `lunes 19 de octubre`.
+- La fecha completa: `miercoles 18 de noviembre`.
 - Si hay música reproduciéndose, una línea con `título · artista`.
 
 El widget queda siempre **por debajo** de las ventanas en mosaico.
@@ -625,14 +625,20 @@ y un contador de versión: cada widget repinta solo si esa versión cambió.
 Las imágenes de este README son capturas reales de zwm compilado desde este repositorio, todas de la misma
 pasada:
 
-- Un servidor X anidado (`Xephyr` en `:1`, 1600 × 900).
+- Un servidor X anidado (`Xephyr`, 1600 × 900).
 - Un bus de sesión propio (`dbus-run-session`), para que las notificaciones y la música de las pruebas
   no se mezclaran con las del escritorio real. No se arrancó el autostart.
-- Las pulsaciones se enviaron con XTEST, así que zwm las recibió como teclas reales.
-- Un reproductor MPRIS de prueba con tres pistas, para la tarjeta de música.
+- Las pulsaciones y los clics se enviaron con XTEST, así que zwm los recibió como teclas y ratón reales.
+- Un reproductor MPRIS de prueba con tres pistas, para la tarjeta de música. Su posición está fija, así
+  que la barra de progreso no se mueve entre capturas.
 - Notificaciones enviadas con `notify-send` al bus de prueba. La de `zwm-music` (captura 19) está simulada con
   `notify-send` con el mismo formato que usa el helper: no se llamó a Spotify de verdad.
-- El nombre de la Wi-Fi está tapado con «Mi red» en todas las capturas con barra. Las de bloqueo no tienen barra.
+- Para que no aparezcan datos de la máquina donde se hicieron, el entorno de pruebas suplanta lo que el WM
+  lee del sistema: un NetworkManager falso en el bus (la red se llama «Mi red»), un `wpctl` de prueba (40 %),
+  y el nombre de usuario de la pantalla de bloqueo (`usuario`). Las terminales usan un prompt neutro
+  (`[usuario] as equipo in ~/zwm`). El `PATH` de la sesión no incluye `curl`, así que no hay consultas de
+  letras, ni `zwm-watch`, así que no se toca ninguna cuenta de Spotify.
+- La fecha y la hora son las reales del momento de la captura, y el nivel de batería es el de la máquina.
 
 ---
 
@@ -650,8 +656,3 @@ pasada:
 - **Ruta fija.** `claude_cmd` y el autostart de ejemplo usan `~/Proyectos`.
 - **Música solo con Spotify Premium** y una app propia en el panel de desarrolladores de Spotify. La
   parte de Spotify se probó con la API simulada, no contra el servicio real.
-
----
-
-<sub>El directorio `.zig-cache/` ocupa unos 760 MB. Está en `.gitignore`, pero conviene borrarlo si hace
-falta espacio (`rm -rf .zig-cache`).</sub>
